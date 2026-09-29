@@ -1,0 +1,49 @@
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--vscode-foreground); background: var(--vscode-editor-background); font-family: var(--vscode-font-family); }
+header { display: flex; justify-content: space-between; gap: 1rem; align-items: center; padding: .7rem 1rem; border-bottom: 1px solid var(--vscode-panel-border); }
+#status { color: var(--vscode-descriptionForeground); text-align: right; }
+#notice { padding: .35rem 1rem; background: var(--vscode-inputValidation-warningBackground); border-bottom: 1px solid var(--vscode-inputValidation-warningBorder); }
+main { display: grid; grid-template-columns: minmax(360px, 2fr) minmax(320px, 1.4fr) minmax(210px, .8fr); gap: 12px; padding: 12px; min-height: calc(100vh - 83px); }
+section, aside { min-width: 0; border: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); padding: 10px; }
+h2, h3 { margin: 0 0 10px; font-size: 1rem; }
+h3 { margin-top: 15px; }
+.panelTitle { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+button, select, input { color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); }
+button { padding: 4px 9px; cursor: pointer; }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--vscode-focusBorder); }
+#volume { display: block; width: 100%; height: min(72vh, 720px); min-height: 320px; background: #101010; cursor: grab; }
+.volumeStack, .sliceImage { position: relative; }
+.imageExpand { position: absolute; top: 8px; right: 8px; z-index: 2; display: grid; place-items: center; width: 34px; height: 34px; padding: 5px; border: 1px solid rgba(255, 255, 255, .55); border-radius: 6px; color: #fff; background: rgba(0, 0, 0, .76); opacity: .9; }
+.imageExpand:hover, .imageExpand:focus-visible { opacity: 1; background: rgba(0, 0, 0, .92); }
+.imageExpand svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.imageExpand .iconRestore, .expanded .imageExpand .iconExpand { display: none; }
+.expanded .imageExpand .iconRestore { display: block; }
+#roiControls label { flex-direction: row; align-items: center; }
+#roiControls input { width: auto; }
+.roiMaskInfo { margin: 6px 0; color: var(--vscode-descriptionForeground); font-size: .9em; }
+.roiSwatch { display: inline-block; width: 1em; height: 1em; border: 1px solid var(--vscode-foreground); }
+#volume:active { cursor: grabbing; }
+#fallback { padding: 20px; color: var(--vscode-errorForeground); }
+#slices { display: grid; grid-template-columns: 1fr; gap: 10px; }
+.slice { min-width: 0; }
+.slice h2 { display: flex; flex-wrap: wrap; justify-content: space-between; }
+.slice small { color: var(--vscode-descriptionForeground); font-weight: normal; }
+.slice canvas { display: block; width: 100%; height: 20vh; min-height: 150px; background: #111; image-rendering: auto; }
+.slice input { width: 100%; }
+body.viewExpanded { overflow: hidden; }
+.expanded { position: fixed !important; inset: 8px; z-index: 50; display: flex !important; flex-direction: column; min-height: 0; border: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); padding: 12px; }
+#volumePanel.expanded .volumeStack { flex: 1; min-height: 0; }
+#volumePanel.expanded #volume { height: 100%; min-height: 0; }
+.slice.expanded .sliceImage { flex: 1; min-height: 0; }
+.slice.expanded canvas { height: 100%; min-height: 0; }
+.slice.expanded h2 { flex: none; }
+.slice.expanded input { flex: none; }
+aside label { display: flex; flex-direction: column; gap: 4px; margin: 9px 0; }
+aside input, aside select { width: 100%; min-height: 24px; }
+dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 8px; overflow-wrap: anywhere; }
+dt { color: var(--vscode-descriptionForeground); }
+dd { margin: 0; }
+@media (max-width: 1100px) { main { grid-template-columns: minmax(320px, 1fr) minmax(260px, 1fr); } aside { grid-column: 1 / -1; } }
+@media (max-width: 700px) { main { display: block; } main > * { margin-bottom: 12px; } #volume { height: 46vh; } }
+@media (max-width: 700px) { #volumePanel.expanded #volume { height: 100%; } }

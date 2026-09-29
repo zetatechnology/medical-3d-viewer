@@ -1,0 +1,35 @@
+{
+  "name": "dicom-3d-viewer",
+  "displayName": "DICOM 3D Viewer",
+  "description": "Local CT DICOM series viewer for VS Code (research and development use)",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "UNLICENSED",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Visualization"],
+  "activationEvents": ["onCommand:dicom3d.openSeries", "onCustomEditor:dicom3d.seriesEditor", "onStartupFinished"],
+  "main": "./src/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "dicom3d.seriesEditor",
+        "displayName": "DICOM 3D Viewer",
+        "selector": [
+          { "filenamePattern": "*.dcm" },
+          { "filenamePattern": "*.DCM" },
+          { "filenamePattern": "*.dicom" },
+          { "filenamePattern": "*.DICOM" },
+          { "filenamePattern": "*.ima" },
+          { "filenamePattern": "*.IMA" }
+        ],
+        "priority": "default"
+      }
+    ],
+    "commands": [
+      { "command": "dicom3d.openSeries", "title": "DICOM: Open CT Series" }
+    ]
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
