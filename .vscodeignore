@@ -1,0 +1,6 @@
+.vscode/**
+test/**
+REQUIREMENTS.md
+.gitignore
+*.vsix
+debug.log
