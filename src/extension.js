@@ -6,9 +6,11 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { DicomError, readHeader, parseDicom, validateSeries, decodePixels } = require('./dicom');
 const { RTSTRUCT, parseRtstruct } = require('./rtstruct');
+const { NiftiError, readNiftiFile, scanNiftiRange, decodeNiftiSlice } = require('./nifti');
 
 const MAX_FILES = 10000;
-const MAX_VOXELS = 120_000_000;
+const MAX_VOXELS = 140_000_000;
+const MAX_NIFTI_BYTES = MAX_VOXELS * 8 + 4096;
 let currentPanel;
 const activeLoads = new Set();
 
@@ -67,8 +69,8 @@ function panelHtml(panel, extensionUri) {
   return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${panel.webview.cspSource}; script-src 'nonce-${nonce}'; img-src ${panel.webview.cspSource};">
     <meta name="viewport" content="width=device-width,initial-scale=1.0"><link rel="stylesheet" href="${style}">
-    <title>DICOM 3D Viewer</title></head><body>
-    <header><strong>DICOM 3D Viewer</strong><span id="status" role="status">Ready to load</span><button id="cancelLoad" type="button">Cancel loading</button></header>
+    <title>Medical 3D Viewer</title></head><body>
+    <header><strong>Medical 3D Viewer</strong><span id="status" role="status">Ready to load</span><button id="cancelLoad" type="button">Cancel loading</button></header>
     <div id="notice">For research and development only. Not for diagnosis.</div>
     <main>
       <section id="volumePanel" aria-label="3D volume">
@@ -103,10 +105,20 @@ function panelHtml(panel, extensionUri) {
 }
 
 function safeError(error) {
-  if (error instanceof DicomError) return error.message;
+  if (error instanceof DicomError || error instanceof NiftiError) return error.message;
   if (error?.code === 'ENOENT') return 'File not found.';
   if (error?.code === 'EACCES' || error?.code === 'EPERM') return 'Permission denied while reading a file.';
   return 'Could not load the series. Check the file format and available memory.';
+}
+
+async function sendSlice(panel, cancellation, index, pixels) {
+  return new Promise(resolve => {
+    cancellation.ack = resolve;
+    void panel.webview.postMessage({ type: 'slice', index,
+      pixels: Buffer.from(pixels.buffer, pixels.byteOffset, pixels.byteLength).toString('base64') })
+      .then(delivered => { if (!delivered && cancellation.ack === resolve) { cancellation.ack = null; resolve(false); } })
+      .catch(() => { if (cancellation.ack === resolve) { cancellation.ack = null; resolve(false); } });
+  });
 }
 
 async function loadSeries(panel, records, rtFiles, cancellation) {
@@ -152,13 +164,7 @@ async function loadSeries(panel, records, rtFiles, cancellation) {
       }
       const data = await fs.readFile(volume.images[i].file);
       const pixels = decodePixels(data, volume.images[i]);
-      const acknowledged = await new Promise(resolve => {
-        cancellation.ack = resolve;
-        void panel.webview.postMessage({ type: 'slice', index: i,
-          pixels: Buffer.from(pixels.buffer).toString('base64') })
-          .then(delivered => { if (!delivered && cancellation.ack === resolve) { cancellation.ack = null; resolve(false); } })
-          .catch(() => { if (cancellation.ack === resolve) { cancellation.ack = null; resolve(false); } });
-      });
+      const acknowledged = await sendSlice(panel, cancellation, i, pixels);
       if (!acknowledged) return;
     }
     await panel.webview.postMessage({ type: 'complete' });
@@ -167,7 +173,42 @@ async function loadSeries(panel, records, rtFiles, cancellation) {
   }
 }
 
-function showViewer(panel, context, records, rtFiles) {
+async function loadNifti(panel, file, cancellation) {
+  try {
+    await panel.webview.postMessage({ type: 'status', text: 'Reading NIfTI volume' });
+    const volume = await readNiftiFile(file, MAX_NIFTI_BYTES);
+    const total = volume.rows * volume.columns * volume.count;
+    if (total > MAX_VOXELS) throw new NiftiError('MEMORY', 'The volume exceeds the size limit.');
+    if (cancellation.cancelled) return;
+    const { minimum, maximum } = scanNiftiRange(volume);
+    const integerType = !volume.datatypeName.startsWith('float');
+    const voxelEncoding = integerType && Number.isInteger(volume.slope) && Number.isInteger(volume.intercept) &&
+      minimum >= 0 && maximum <= 255 ? 'uint8' : 'float32';
+    await panel.webview.postMessage({ type: 'start', meta: {
+      rows: volume.rows, columns: volume.columns, count: volume.count,
+      spacing: volume.spacing, sliceSpacing: volume.sliceSpacing,
+      origin: volume.origin, row: volume.row, column: volume.column, normal: volume.normal,
+      seriesNumber: path.basename(file), modality: 'NIfTI', datatype: volume.datatypeName,
+      voxelEncoding, textureScale: voxelEncoding === 'uint8' ? 255 : 1, rois: []
+    } });
+    for (let i = 0; i < volume.count; i++) {
+      if (cancellation.cancelled) {
+        await panel.webview.postMessage({ type: 'cancel' });
+        return;
+      }
+      const pixels = decodeNiftiSlice(volume, i, voxelEncoding);
+      const acknowledged = await sendSlice(panel, cancellation, i, pixels);
+      if (!acknowledged) return;
+    }
+    const displayWindow = Number.isFinite(minimum) && Number.isFinite(maximum)
+      ? { level: (minimum + maximum) / 2, width: Math.max(maximum - minimum, 1) } : undefined;
+    await panel.webview.postMessage({ type: 'complete', displayWindow });
+  } catch (error) {
+    if (!cancellation.cancelled) await panel.webview.postMessage({ type: 'error', text: safeError(error) });
+  }
+}
+
+function showViewer(panel, context, loader) {
   const cancellation = { cancelled: false };
   activeLoads.add(cancellation);
   panel.onDidDispose(() => {
@@ -178,7 +219,7 @@ function showViewer(panel, context, records, rtFiles) {
     if (currentPanel === panel) currentPanel = undefined;
   });
   panel.webview.onDidReceiveMessage(message => {
-    if (message?.type === 'ready') void loadSeries(panel, records, rtFiles, cancellation);
+    if (message?.type === 'ready') void loader(panel, cancellation);
     if (message?.type === 'sliceAck' && cancellation.ack) {
       const resolve = cancellation.ack;
       cancellation.ack = null;
@@ -221,11 +262,11 @@ async function openSeries(context) {
   const choice = await vscode.window.showQuickPick(choices, { placeHolder: 'Select a CT series to display' });
   if (!choice) return;
   currentPanel?.dispose();
-  const panel = vscode.window.createWebviewPanel('dicom3d.viewer', 'DICOM 3D Viewer',
+  const panel = vscode.window.createWebviewPanel('dicom3d.viewer', 'Medical 3D Viewer',
     vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true,
       localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media')] });
   currentPanel = panel;
-  showViewer(panel, context, choice.records, found.rtFiles);
+  showViewer(panel, context, (target, cancellation) => loadSeries(target, choice.records, found.rtFiles, cancellation));
 }
 
 function showEditorError(panel, message) {
@@ -243,7 +284,13 @@ function sameFile(a, b) {
 
 async function openFileSeries(context, document, panel, token) {
   if (document.uri.scheme !== 'file') {
-    showEditorError(panel, 'Only local DICOM files are supported.');
+    showEditorError(panel, 'Only local DICOM and NIfTI files are supported.');
+    return;
+  }
+  if (/\.nii(?:\.gz)?$/i.test(document.uri.fsPath)) {
+    panel.webview.options = { ...panel.webview.options, enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media')] };
+    showViewer(panel, context, (target, cancellation) => loadNifti(target, document.uri.fsPath, cancellation));
     return;
   }
   panel.webview.html = '<!DOCTYPE html><html lang="en"><meta charset="UTF-8"><body><p>Searching for DICOM series…</p></body></html>';
@@ -273,7 +320,7 @@ async function openFileSeries(context, document, panel, token) {
   }
   panel.webview.options = { ...panel.webview.options, enableScripts: true,
     localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media')] };
-  showViewer(panel, context, records, found.rtFiles);
+  showViewer(panel, context, (target, cancellation) => loadSeries(target, records, found.rtFiles, cancellation));
 }
 
 function activate(context) {

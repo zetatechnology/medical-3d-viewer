@@ -310,7 +310,7 @@
     uniform usampler3D roiMask;
     uniform vec3 roiColors[8];
     uniform vec3 sizeMm, rightVec, upVec, forwardVec, clipLow, clipHigh;
-    uniform float aspect, zoom, level, windowWidth, opacity, roiOpacity;
+    uniform float aspect, zoom, level, windowWidth, opacity, roiOpacity, voxelScale;
     uniform vec2 pan;
     uniform int preset, roiCount;
     uniform uint visibleRois;
@@ -336,7 +336,7 @@
       for (int i = 0; i < 160; i++) {
         vec3 pos = origin + direction * (start + (float(i) + 0.5) * dt);
         vec3 texCoord = pos / sizeMm + 0.5;
-        float value = texture(volume, texCoord).r;
+        float value = texture(volume, texCoord).r * voxelScale;
         float normalized = clamp((value - level) / windowWidth + 0.5, 0.0, 1.0);
         float density = preset == 1 ? smoothstep(0.35, 0.8, normalized) :
           preset == 2 ? smoothstep(0.2, 0.7, normalized) : smoothstep(0.15, 0.9, normalized);
@@ -384,7 +384,8 @@
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
     const texture = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_3D, texture);
-    const linearSupported = Boolean(gl.getExtension('OES_texture_float_linear'));
+    const byteVoxels = voxels instanceof Uint8Array;
+    const linearSupported = byteVoxels || Boolean(gl.getExtension('OES_texture_float_linear'));
     $('volumeInterpolation').querySelector('[value="linear"]').disabled = !linearSupported;
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
@@ -394,7 +395,8 @@
     const max = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE);
     if (Math.max(meta.columns, meta.rows, meta.count) > max) throw new Error(`The volume exceeds the GPU 3D texture limit (${max}).`);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R32F, meta.columns, meta.rows, meta.count, 0, gl.RED, gl.FLOAT, voxels);
+    gl.texImage3D(gl.TEXTURE_3D, 0, byteVoxels ? gl.R8 : gl.R32F,
+      meta.columns, meta.rows, meta.count, 0, gl.RED, byteVoxels ? gl.UNSIGNED_BYTE : gl.FLOAT, voxels);
     if (gl.getError() !== gl.NO_ERROR) throw new Error('Could not upload the volume to the GPU.');
     const roiTexture = gl.createTexture();
     gl.activeTexture(gl.TEXTURE1);
@@ -462,6 +464,7 @@
     const win = currentWindow();
     if (!win) return;
     float('level', win.level); float('windowWidth', win.width);
+    float('voxelScale', meta.textureScale || 1);
     float('opacity', Number($('opacity').value) / 100);
     float('roiOpacity', Number($('roiOpacity').value) / 100);
     gl.uniform1i(gl.getUniformLocation(program, 'preset'), ['soft', 'bone', 'lung'].indexOf($('preset').value));
@@ -501,11 +504,12 @@
 
   function showMeta() {
     const values = [
-      ['Modality', 'CT'], ['Slices', `${meta.count}`],
+      ['Format', meta.modality || 'DICOM CT'], ['Slices', `${meta.count}`],
       ['Dimensions', `${meta.columns} × ${meta.rows}`],
       ['Pixel spacing', `${meta.spacing[0]} × ${meta.spacing[1]} mm`],
       ['Slice spacing', `${meta.sliceSpacing.toFixed(2)} mm`],
-      ['Series number', meta.seriesNumber], ['ROIs', `${meta.rois.length}`]
+      [meta.modality === 'NIfTI' ? 'File' : 'Series number', meta.seriesNumber],
+      ...(meta.datatype ? [['Data type', meta.datatype]] : []), ['ROIs', `${meta.rois.length}`]
     ];
     const dl = $('metadata');
     dl.replaceChildren();
@@ -524,7 +528,9 @@
         meta = message.meta;
         roiMask = null;
         disposeRenderer();
-        voxels = new Float32Array(meta.columns * meta.rows * meta.count);
+        voxels = meta.voxelEncoding === 'uint8'
+          ? new Uint8Array(meta.columns * meta.rows * meta.count)
+          : new Float32Array(meta.columns * meta.rows * meta.count);
         received = 0;
         bounds = calcBounds();
         setupSliders();
@@ -541,7 +547,7 @@
         const binary = atob(message.pixels);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        const slice = new Float32Array(bytes.buffer);
+        const slice = meta.voxelEncoding === 'uint8' ? bytes : new Float32Array(bytes.buffer);
         if (slice.length !== meta.rows * meta.columns) throw new Error('Invalid slice size.');
         voxels.set(slice, message.index * slice.length);
         received++;
@@ -549,6 +555,10 @@
         vscode.postMessage({ type: 'sliceAck', ok: true });
       } else if (message.type === 'complete') {
         if (received !== meta.count) throw new Error('Some slices are missing.');
+        if (message.displayWindow) {
+          $('level').value = String(message.displayWindow.level);
+          $('width').value = String(message.displayWindow.width);
+        }
         status('Building 3D ROI masks');
         roiMask = window.RoiMask.buildMask(meta);
         const maskInfo = [];

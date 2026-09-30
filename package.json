@@ -1,10 +1,18 @@
 {
-  "name": "dicom-3d-viewer",
-  "displayName": "DICOM 3D Viewer",
-  "description": "Local CT DICOM series viewer for VS Code (research and development use)",
+  "name": "medical-3d-viewer",
+  "displayName": "Medical 3D Viewer",
+  "description": "Local DICOM CT series and NIfTI volume viewer for VS Code (research and development use)",
   "version": "0.1.0",
   "publisher": "local",
   "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hiroyakubo/medical-3d-viewer.git"
+  },
+  "homepage": "https://github.com/hiroyakubo/medical-3d-viewer#readme",
+  "bugs": {
+    "url": "https://github.com/hiroyakubo/medical-3d-viewer/issues"
+  },
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Visualization"],
   "activationEvents": ["onCommand:dicom3d.openSeries", "onCustomEditor:dicom3d.seriesEditor", "onStartupFinished"],
@@ -13,20 +21,24 @@
     "customEditors": [
       {
         "viewType": "dicom3d.seriesEditor",
-        "displayName": "DICOM 3D Viewer",
+        "displayName": "Medical 3D Viewer",
         "selector": [
           { "filenamePattern": "*.dcm" },
           { "filenamePattern": "*.DCM" },
           { "filenamePattern": "*.dicom" },
           { "filenamePattern": "*.DICOM" },
           { "filenamePattern": "*.ima" },
-          { "filenamePattern": "*.IMA" }
+          { "filenamePattern": "*.IMA" },
+          { "filenamePattern": "*.nii" },
+          { "filenamePattern": "*.NII" },
+          { "filenamePattern": "*.nii.gz" },
+          { "filenamePattern": "*.NII.GZ" }
         ],
         "priority": "default"
       }
     ],
     "commands": [
-      { "command": "dicom3d.openSeries", "title": "DICOM: Open CT Series" }
+      { "command": "dicom3d.openSeries", "title": "Medical 3D Viewer: Open DICOM CT Series" }
     ]
   },
   "scripts": {
