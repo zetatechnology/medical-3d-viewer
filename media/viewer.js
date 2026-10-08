@@ -3,6 +3,13 @@
   const vscode = acquireVsCodeApi();
   const $ = id => document.getElementById(id);
   const status = text => { $('status').textContent = text; };
+  function showProgress(percent = null) {
+    const progress = $('loadProgress');
+    progress.hidden = false;
+    if (percent === null) progress.removeAttribute('value');
+    else progress.value = percent;
+  }
+  const hideProgress = () => { $('loadProgress').hidden = true; };
   const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
   const add = (a, b) => a.map((v, i) => v + b[i]);
   const scale = (a, s) => a.map(v => v * s);
@@ -523,7 +530,7 @@
   window.addEventListener('message', event => {
     const message = event.data;
     try {
-      if (message.type === 'status') status(message.text);
+      if (message.type === 'status') { status(message.text); showProgress(); }
       else if (message.type === 'start') {
         meta = message.meta;
         roiMask = null;
@@ -542,6 +549,8 @@
         setupRoiControls();
         showMeta();
         status('Loading 0%');
+        showProgress(0);
+        $('cancelLoad').disabled = false;
       } else if (message.type === 'slice') {
         if (!voxels || !meta || message.index !== received) throw new Error('Slices arrived out of order.');
         const binary = atob(message.pixels);
@@ -551,7 +560,9 @@
         if (slice.length !== meta.rows * meta.columns) throw new Error('Invalid slice size.');
         voxels.set(slice, message.index * slice.length);
         received++;
-        status(`Loading ${Math.round(received * 100 / meta.count)}%`);
+        const percent = Math.round(received * 100 / meta.count);
+        status(`Loading ${percent}%`);
+        showProgress(percent);
         vscode.postMessage({ type: 'sliceAck', ok: true });
       } else if (message.type === 'complete') {
         if (received !== meta.count) throw new Error('Some slices are missing.');
@@ -560,6 +571,7 @@
           $('width').value = String(message.displayWindow.width);
         }
         status('Building 3D ROI masks');
+        showProgress();
         roiMask = window.RoiMask.buildMask(meta);
         const maskInfo = [];
         if (meta.rois.length > window.RoiMask.MAX_ROIS)
@@ -575,13 +587,17 @@
         renderer = createRenderer();
         if (roiMask) roiMask.data = null;
         renderSlices(); requestRender();
-        status('Ready'); $('cancelLoad').disabled = true;
-      } else if (message.type === 'cancel') { voxels = null; status('Loading cancelled'); }
-      else if (message.type === 'error') { voxels = null; status(message.text); }
+        status('Ready'); hideProgress(); $('cancelLoad').disabled = true;
+      } else if (message.type === 'cancel') {
+        voxels = null; status('Loading cancelled'); hideProgress(); $('cancelLoad').disabled = true;
+      } else if (message.type === 'error') {
+        voxels = null; status(message.text); hideProgress(); $('cancelLoad').disabled = true;
+      }
     } catch (error) {
       if (message.type === 'slice') vscode.postMessage({ type: 'sliceAck', ok: false });
       voxels = null;
       status(error.message || 'Could not display the series.');
+      hideProgress(); $('cancelLoad').disabled = true;
     }
   });
 
@@ -619,6 +635,7 @@
     vscode.postMessage({ type: 'cancel' });
     voxels = null;
     status('Loading cancelled');
+    hideProgress();
     $('cancelLoad').disabled = true;
   });
   const canvas = $('volume');

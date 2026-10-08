@@ -95,12 +95,14 @@ function parseDicom(data, options = {}) {
     [0x00080060, 'modality'], [0x0020000d, 'studyUid'], [0x0020000e, 'seriesUid'],
     [0x00200011, 'seriesNumber'], [0x0008103e, 'description'],
     [0x00080016, 'sopClass'], [0x00080018, 'sopInstanceUid'],
-    [0x00200052, 'frameOfReferenceUid'], [0x00280004, 'photometric']
+    [0x00200052, 'frameOfReferenceUid'], [0x00280004, 'photometric'],
+    [0x00280008, 'numberOfFrames']
   ]);
   const numberTags = new Map([
     [0x00200032, 'position'], [0x00200037, 'orientation'], [0x00280030, 'spacing'],
     [0x00281052, 'intercept'], [0x00281053, 'slope']
   ]);
+  const windowTags = new Map([[0x00281050, 'windowCenter'], [0x00281051, 'windowWidth']]);
   const scalarTags = new Map([
     [0x00280002, 'samplesPerPixel'], [0x00280010, 'rows'], [0x00280011, 'columns'],
     [0x00280100, 'bitsAllocated'], [0x00280101, 'bitsStored'], [0x00280102, 'highBit'],
@@ -118,6 +120,11 @@ function parseDicom(data, options = {}) {
     }
     if (textTags.has(e.tag)) out[textTags.get(e.tag)] = stringValue(data, e);
     if (numberTags.has(e.tag)) out[numberTags.get(e.tag)] = numbers(data, e);
+    if (windowTags.has(e.tag)) {
+      // Optional display windows must not prevent loading otherwise valid images.
+      const values = stringValue(data, e).split('\\').map(value => value.trim() ? Number(value) : NaN);
+      if (values.every(Number.isFinite)) out[windowTags.get(e.tag)] = values;
+    }
     if (scalarTags.has(e.tag)) out[scalarTags.get(e.tag)] = scalar(data, e);
     cursor = nextOffset(data, e, explicit);
   }
@@ -130,18 +137,32 @@ function cross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b
 function norm(v) { return Math.hypot(...v); }
 function close(a, b, tolerance) { return Math.abs(a - b) <= tolerance; }
 
+function validateImage(image) {
+  if (image.sopClass !== CT_IMAGE || image.modality !== 'CT' ||
+      (image.numberOfFrames !== undefined && Number(image.numberOfFrames) !== 1)) {
+    throw new DicomError('SOP_CLASS', 'Only single-frame CT images are supported.');
+  }
+  if (image.photometric !== 'MONOCHROME2' || image.samplesPerPixel !== 1 || image.bitsAllocated !== 16 ||
+      ![12, 16].includes(image.bitsStored) || image.highBit !== image.bitsStored - 1 ||
+      ![0, 1].includes(image.pixelRepresentation)) throw new DicomError('PIXEL_FORMAT', 'Unsupported pixel format.');
+  if (!image.rows || !image.columns ||
+      (image.slope && image.slope.length !== 1) || (image.intercept && image.intercept.length !== 1)) {
+    throw new DicomError('METADATA', 'Image dimensions or rescale metadata are invalid.');
+  }
+  if (image.pixelOffset < 0 || image.pixelLength < image.rows * image.columns * 2) {
+    throw new DicomError('PIXEL_DATA', 'Pixel Data is incomplete.');
+  }
+  return image;
+}
+
 function validateSeries(images) {
   if (images.length < 2) throw new DicomError('SERIES', '3D display requires at least two slices.');
   const first = images[0];
   for (const image of images) {
-    if (image.sopClass !== CT_IMAGE || image.modality !== 'CT') throw new DicomError('SOP_CLASS', 'Only single-frame CT images are supported.');
-    if (image.photometric !== 'MONOCHROME2' || image.samplesPerPixel !== 1 || image.bitsAllocated !== 16 ||
-        ![12, 16].includes(image.bitsStored) || image.highBit !== image.bitsStored - 1 ||
-        ![0, 1].includes(image.pixelRepresentation)) throw new DicomError('PIXEL_FORMAT', 'Unsupported pixel format.');
+    validateImage(image);
     if (!image.seriesUid || !image.studyUid || !image.position || image.position.length !== 3 ||
         !image.orientation || image.orientation.length !== 6 || !image.spacing || image.spacing.length !== 2 ||
-        !image.rows || !image.columns || image.spacing.some(v => v <= 0) ||
-        (image.slope && image.slope.length !== 1) || (image.intercept && image.intercept.length !== 1)) {
+        image.spacing.some(v => v <= 0)) {
       throw new DicomError('METADATA', 'Metadata required for 3D reconstruction is missing.');
     }
     if (image.rows !== first.rows || image.columns !== first.columns ||
@@ -150,9 +171,6 @@ function validateSeries(images) {
         image.seriesUid !== first.seriesUid || image.studyUid !== first.studyUid ||
         image.frameOfReferenceUid !== first.frameOfReferenceUid) {
       throw new DicomError('GEOMETRY', 'Dimensions, pixel spacing, or orientation differ between slices.');
-    }
-    if (image.pixelOffset < 0 || image.pixelLength < image.rows * image.columns * 2) {
-      throw new DicomError('PIXEL_DATA', 'Pixel Data is incomplete.');
     }
   }
   const row = first.orientation.slice(0, 3);
@@ -205,5 +223,5 @@ async function readHeader(file) {
   } finally { await handle.close(); }
 }
 
-module.exports = { DicomError, parseDicom, validateSeries, decodePixels, readHeader,
+module.exports = { DicomError, parseDicom, validateImage, validateSeries, decodePixels, readHeader,
   TS_IMPLICIT, TS_EXPLICIT, CT_IMAGE };

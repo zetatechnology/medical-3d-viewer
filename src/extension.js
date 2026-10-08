@@ -4,13 +4,14 @@ const vscode = require('vscode');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { DicomError, readHeader, parseDicom, validateSeries, decodePixels } = require('./dicom');
+const { DicomError, readHeader, parseDicom, validateImage, validateSeries, decodePixels } = require('./dicom');
 const { RTSTRUCT, parseRtstruct } = require('./rtstruct');
 const { NiftiError, readNiftiFile, scanNiftiRange, decodeNiftiSlice } = require('./nifti');
 
 const MAX_FILES = 10000;
 const MAX_VOXELS = 140_000_000;
 const MAX_NIFTI_BYTES = MAX_VOXELS * 8 + 4096;
+const MAX_IMAGE_BYTES = 64 * 1024 * 1024;
 let currentPanel;
 const activeLoads = new Set();
 
@@ -70,7 +71,7 @@ function panelHtml(panel, extensionUri) {
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${panel.webview.cspSource}; script-src 'nonce-${nonce}'; img-src ${panel.webview.cspSource};">
     <meta name="viewport" content="width=device-width,initial-scale=1.0"><link rel="stylesheet" href="${style}">
     <title>Medical 3D Viewer</title></head><body>
-    <header><strong>Medical 3D Viewer</strong><span id="status" role="status">Ready to load</span><button id="cancelLoad" type="button">Cancel loading</button></header>
+    <header><strong>Medical 3D Viewer</strong><div class="loadStatus"><span id="status" role="status">Ready to load</span><progress id="loadProgress" max="100" aria-label="Volume loading progress"></progress></div><button id="cancelLoad" type="button">Cancel loading</button></header>
     <div id="notice">For research and development only. Not for diagnosis.</div>
     <main>
       <section id="volumePanel" aria-label="3D volume">
@@ -208,7 +209,61 @@ async function loadNifti(panel, file, cancellation) {
   }
 }
 
-function showViewer(panel, context, loader) {
+function imagePanelHtml(panel, extensionUri) {
+  const nonce = crypto.randomBytes(16).toString('base64');
+  const script = panel.webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'image-viewer.js'));
+  const style = panel.webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'viewer.css'));
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${panel.webview.cspSource}; script-src 'nonce-${nonce}';">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0"><link rel="stylesheet" href="${style}">
+    <title>DICOM 2D Viewer</title></head><body class="imageViewer">
+    <header><strong>DICOM 2D Viewer</strong><span id="status" role="status">Ready to load</span><button id="cancelLoad" type="button">Cancel loading</button></header>
+    <div id="notice">For research and development only. Not for diagnosis.</div>
+    <main>
+      <section aria-label="Single DICOM image">
+        <div class="panelTitle"><h2>2D image <small id="imageZoom">100%</small></h2><button id="resetImage" type="button">Reset view</button></div>
+        <canvas id="image" tabindex="0" aria-label="Single CT image. Scroll or use plus and minus to zoom; drag to pan." title="Scroll: zoom / Drag: pan"></canvas>
+      </section>
+      <aside aria-label="Display settings"><h2>Display settings</h2>
+        <button id="loadSeries" type="button" disabled>Load series in 3D</button>
+        <label>Preset <select id="preset"><option value="dicom">DICOM window</option><option value="soft">Soft tissue</option><option value="bone">Bone</option><option value="lung">Lung</option></select></label>
+        <label>Window level <input id="level" type="number" value="40" step="1"></label>
+        <label>Window width <input id="width" type="number" value="400" min="1" step="1"></label>
+        <h3>Image information</h3><dl id="metadata"></dl>
+      </aside>
+    </main><script nonce="${nonce}" src="${script}"></script></body></html>`;
+}
+
+async function loadImage(panel, file, cancellation) {
+  try {
+    await panel.webview.postMessage({ type: 'status', text: 'Reading DICOM image' });
+    const stat = await fs.stat(file);
+    if (stat.size > MAX_IMAGE_BYTES) throw new DicomError('MEMORY', 'The image file exceeds the 64 MiB size limit.');
+    if (cancellation.cancelled) return;
+    const data = await fs.readFile(file);
+    const image = validateImage(parseDicom(data));
+    if (Math.max(image.rows, image.columns) > 16384 || image.rows * image.columns > 16_777_216) {
+      throw new DicomError('MEMORY', 'The image exceeds the 2D display size limit.');
+    }
+    const pixels = decodePixels(data, image);
+    if (cancellation.cancelled) return;
+    const spacing = image.spacing?.length === 2 && image.spacing.every(v => Number.isFinite(v) && v > 0)
+      ? image.spacing : null;
+    const level = image.windowCenter?.[0];
+    const width = image.windowWidth?.[0];
+    const displayWindow = Number.isFinite(level) && Number.isFinite(width) && width > 0
+      ? { level, width } : { level: 40, width: 400 };
+    const delivered = await panel.webview.postMessage({ type: 'image', meta: {
+      rows: image.rows, columns: image.columns, spacing,
+      seriesNumber: image.seriesNumber || '—', displayWindow
+    }, pixels: Buffer.from(pixels.buffer, pixels.byteOffset, pixels.byteLength).toString('base64') });
+    cancellation.imageLoaded = delivered;
+  } catch (error) {
+    if (!cancellation.cancelled) await panel.webview.postMessage({ type: 'error', text: safeError(error) });
+  }
+}
+
+function showViewer(panel, context, loader, html = panelHtml, seriesLoader) {
   const cancellation = { cancelled: false };
   activeLoads.add(cancellation);
   panel.onDidDispose(() => {
@@ -220,6 +275,15 @@ function showViewer(panel, context, loader) {
   });
   panel.webview.onDidReceiveMessage(message => {
     if (message?.type === 'ready') void loader(panel, cancellation);
+    if (message?.type === 'loadSeries' && seriesLoader && cancellation.imageLoaded &&
+        !cancellation.cancelled && !cancellation.seriesRequested) {
+      cancellation.seriesRequested = true;
+      void seriesLoader(panel, cancellation, nextLoader => {
+        loader = nextLoader;
+        seriesLoader = null;
+        panel.webview.html = panelHtml(panel, context.extensionUri);
+      });
+    }
     if (message?.type === 'sliceAck' && cancellation.ack) {
       const resolve = cancellation.ack;
       cancellation.ack = null;
@@ -231,7 +295,35 @@ function showViewer(panel, context, loader) {
       cancellation.ack = null;
     }
   });
-  panel.webview.html = panelHtml(panel, context.extensionUri);
+  panel.webview.html = html(panel, context.extensionUri);
+}
+
+async function loadFileSeries(panel, file, cancellation, show) {
+  try {
+    const found = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification,
+      title: 'Searching for DICOM series', cancellable: true }, async (progress, token) => {
+      const found = await findSeries(path.dirname(file), progress, {
+        get isCancellationRequested() { return cancellation.cancelled || token.isCancellationRequested; }
+      });
+      return token.isCancellationRequested ? null : found;
+    });
+    if (cancellation.cancelled) return;
+    if (!found) throw new DicomError('CANCELLED', 'Series search was cancelled.');
+    const normalized = value => {
+      const absolute = path.resolve(value);
+      return process.platform === 'win32' ? absolute.toLowerCase() : absolute;
+    };
+    const records = [...found.groups.values()].find(group =>
+      group.some(record => normalized(record.file) === normalized(file)));
+    if (!records) throw new DicomError('SERIES', 'No supported CT series found for this image.');
+    if (records.length < 2) throw new DicomError('SERIES', '3D display requires at least two slices.');
+    show((target, loadCancellation) => loadSeries(target, records, found.rtFiles, loadCancellation));
+  } catch (error) {
+    if (!cancellation.cancelled) {
+      cancellation.seriesRequested = false;
+      await panel.webview.postMessage({ type: 'seriesResult', text: safeError(error) });
+    }
+  }
 }
 
 async function openSeries(context) {
@@ -276,13 +368,8 @@ function showEditorError(panel, message) {
   panel.webview.html = `<!DOCTYPE html><html lang="en"><meta charset="UTF-8"><body><p>${escaped}</p></body></html>`;
 }
 
-function sameFile(a, b) {
-  const left = path.resolve(a);
-  const right = path.resolve(b);
-  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
-}
-
-async function openFileSeries(context, document, panel, token) {
+async function openFileViewer(context, document, panel, token) {
+  if (token.isCancellationRequested) return;
   if (document.uri.scheme !== 'file') {
     showEditorError(panel, 'Only local DICOM and NIfTI files are supported.');
     return;
@@ -293,41 +380,17 @@ async function openFileSeries(context, document, panel, token) {
     showViewer(panel, context, (target, cancellation) => loadNifti(target, document.uri.fsPath, cancellation));
     return;
   }
-  panel.webview.html = '<!DOCTYPE html><html lang="en"><meta charset="UTF-8"><body><p>Searching for DICOM series…</p></body></html>';
-  let found;
-  try {
-    found = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification,
-      title: 'Searching for DICOM series', cancellable: true }, (progress, progressToken) =>
-      findSeries(path.dirname(document.uri.fsPath), progress, {
-        get isCancellationRequested() {
-          return token.isCancellationRequested || progressToken.isCancellationRequested;
-        }
-      }));
-  } catch (error) {
-    if (!token.isCancellationRequested) showEditorError(panel, safeError(error));
-    return;
-  }
-  if (token.isCancellationRequested) return;
-  if (!found) {
-    showEditorError(panel, 'Series search was cancelled.');
-    return;
-  }
-  const records = [...found.groups.values()].find(group =>
-    group.some(record => sameFile(record.file, document.uri.fsPath)));
-  if (!records) {
-    showEditorError(panel, 'The selected file is not part of a supported CT DICOM series.');
-    return;
-  }
   panel.webview.options = { ...panel.webview.options, enableScripts: true,
     localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media')] };
-  showViewer(panel, context, (target, cancellation) => loadSeries(target, records, found.rtFiles, cancellation));
+  showViewer(panel, context, (target, cancellation) => loadImage(target, document.uri.fsPath, cancellation),
+    imagePanelHtml, (target, cancellation, show) => loadFileSeries(target, document.uri.fsPath, cancellation, show));
 }
 
 function activate(context) {
   context.subscriptions.push(vscode.commands.registerCommand('dicom3d.openSeries', () => openSeries(context)));
   context.subscriptions.push(vscode.window.registerCustomEditorProvider('dicom3d.seriesEditor', {
     openCustomDocument: uri => ({ uri, dispose() {} }),
-    resolveCustomEditor: (document, panel, token) => openFileSeries(context, document, panel, token)
+    resolveCustomEditor: (document, panel, token) => openFileViewer(context, document, panel, token)
   }, { webviewOptions: { enableScripts: true, retainContextWhenHidden: true } }));
   const openButton = vscode.window.createStatusBarItem('dicom3d.openSeries', vscode.StatusBarAlignment.Left, 100);
   openButton.text = '$(folder-opened) Open CT';
