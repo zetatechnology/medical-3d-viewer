@@ -36,6 +36,7 @@ function sample(options = {}) {
   const elements = [
     element(0x0008, 0x0016, 'UI', CT_IMAGE),
     element(0x0008, 0x0060, 'CS', 'CT'),
+    element(0x0008, 0x0018, 'UI', `1.2.3.4.${(options.z ?? 0) + 1}`),
     element(0x0020, 0x000d, 'UI', '1.2.3'),
     element(0x0020, 0x000e, 'UI', '1.2.3.4'),
     element(0x0020, 0x0032, 'DS', `0\\0\\${options.z ?? 0}`),
@@ -137,6 +138,7 @@ function extensionHarness(data = sample(), options = {}) {
   const realRequire = createRequire(file);
   const files = { '/ct/clicked.dcm': data, '/ct/other.dcm': sample({ z: 1 }) };
   if (options.single) delete files['/ct/other.dcm'];
+  Object.assign(files, options.files || {});
   const reads = [], messages = [], scans = [], commands = new Map();
   let provider, listener, dispose;
   const panel = {
@@ -306,4 +308,33 @@ test('disposing the panel during series search prevents switching to 3D', async 
   await new Promise(resolve => setImmediate(resolve));
   assert.match(harness.panel.webview.html, /image-viewer.js/);
   assert.equal(harness.messages.some(message => message.type === 'start'), false);
+});
+
+
+test('Open CT and the 2D series button discover LIDC XML and deliver matching ROIs', async () => {
+  const annotations = `<LidcReadMessage><ResponseHeader><StudyInstanceUID>1.2.3</StudyInstanceUID><SeriesInstanceUid>1.2.3.4</SeriesInstanceUid></ResponseHeader><readingSession><unblindedReadNodule><noduleID>001</noduleID><roi><imageSOP_UID>1.2.3.4.1</imageSOP_UID><inclusion>TRUE</inclusion><edgeMap><xCoord>0</xCoord><yCoord>0</yCoord></edgeMap><edgeMap><xCoord>1</xCoord><yCoord>0</yCoord></edgeMap><edgeMap><xCoord>1</xCoord><yCoord>1</yCoord></edgeMap></roi></unblindedReadNodule></readingSession></LidcReadMessage>`;
+  for (const viaButton of [false, true]) {
+    const harness = extensionHarness(sample(), { files: { '/ct/annotations.XML': Buffer.from(annotations) } });
+    if (viaButton) {
+      await harness.open('/ct/clicked.dcm'); harness.send({ type: 'ready' });
+      await waitForMessage(harness, 'image'); harness.send({ type: 'loadSeries' });
+      for (let i = 0; i < 20 && !harness.panel.webview.html.includes('roi-mask.js'); i++)
+        await new Promise(resolve => setImmediate(resolve));
+    } else await harness.commands.get('dicom3d.openSeries')();
+    harness.send({ type: 'ready' });
+    const start = await waitForMessage(harness, 'start');
+    assert.equal(start.meta.rois.length, 1);
+    assert.equal(start.meta.rois[0].name, 'LIDC Reader 1: 001');
+    assert.ok(harness.reads.some(file => file.endsWith('annotations.XML')));
+    await waitForMessage(harness, 'complete'); harness.dispose();
+  }
+});
+
+test('malformed annotation XML reports a warning without preventing CT loading', async () => {
+  const harness = extensionHarness(sample(), { files: { '/ct/annotations.xml': Buffer.from('<broken>') } });
+  await harness.commands.get('dicom3d.openSeries')(); harness.send({ type: 'ready' });
+  const start = await waitForMessage(harness, 'start');
+  assert.equal(start.meta.rois.length, 0);
+  assert.match(start.meta.roiWarnings[0], /Malformed annotation XML/);
+  await waitForMessage(harness, 'complete'); harness.dispose();
 });

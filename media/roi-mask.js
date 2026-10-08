@@ -12,7 +12,7 @@
       dot(relative, meta.normal) / meta.sliceSpacing];
   }
 
-  function fillContour(data, meta, points, bit) {
+  function fillContour(data, meta, points, bit, exclusion = false) {
     const vertices = [];
     let zSum = 0, zMin = Infinity, zMax = -Infinity;
     for (let i = 0; i < points.length; i += 3) {
@@ -47,7 +47,9 @@
         const firstColumn = Math.max(0, Math.ceil(crossings[i]));
         const lastColumn = Math.min(meta.columns - 1, Math.floor(crossings[i + 1]));
         for (let column = firstColumn; column <= lastColumn; column++) {
-          data[sliceOffset + row * meta.columns + column] |= bit;
+          const index = sliceOffset + row * meta.columns + column;
+          if (exclusion) data[index] &= ~bit;
+          else data[index] |= bit;
         }
       }
     }
@@ -61,8 +63,12 @@
     let skippedContours = 0;
     for (let i = 0; i < rois.length; i++) {
       const bit = 1 << i;
-      for (const contour of rois[i].contours) {
-        if (!fillContour(data, meta, contour.points, bit)) skippedContours++;
+      // Fill all inclusions first; exclusions remove only this ROI's bit.
+      for (const exclusion of [false, true]) {
+        for (const contour of rois[i].contours) {
+          if (!!contour.exclusion !== exclusion) continue;
+          if (!fillContour(data, meta, contour.points, bit, exclusion)) skippedContours++;
+        }
       }
     }
     return { data, rois, skippedContours };

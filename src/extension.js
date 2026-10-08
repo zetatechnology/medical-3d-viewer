@@ -6,6 +6,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { DicomError, readHeader, parseDicom, validateImage, validateSeries, decodePixels } = require('./dicom');
 const { RTSTRUCT, parseRtstruct } = require('./rtstruct');
+const { parseLidcXml, MAX_XML_BYTES } = require('./lidc');
 const { NiftiError, readNiftiFile, scanNiftiRange, decodeNiftiSlice } = require('./nifti');
 
 const MAX_FILES = 10000;
@@ -39,11 +40,13 @@ async function findSeries(root, progress, token) {
   if (!files) return null;
   const groups = new Map();
   const rtFiles = [];
+  const xmlFiles = [];
   let unsupported = 0;
   for (let index = 0; index < files.length; index++) {
     if (token.isCancellationRequested) return null;
     const file = files[index];
     try {
+      if (/\.xml$/i.test(file)) { xmlFiles.push(file); continue; }
       const meta = await readHeader(file);
       if (meta.sopClass === RTSTRUCT && meta.modality === 'RTSTRUCT') {
         rtFiles.push(file);
@@ -58,7 +61,7 @@ async function findSeries(root, progress, token) {
     }
     if (index % 10 === 0) progress.report({ message: `Scanning ${index + 1}/${files.length} files` });
   }
-  return { groups, rtFiles, unsupported, total: files.length };
+  return { groups, rtFiles, xmlFiles, unsupported, total: files.length };
 }
 
 function panelHtml(panel, extensionUri) {
@@ -91,7 +94,7 @@ function panelHtml(panel, extensionUri) {
         <label>Window width <input id="width" type="number" value="400" min="1" step="1"></label>
         <label>Opacity <input id="opacity" type="range" min="0" max="100" value="35"></label>
         <label>3D CT sampling <select id="volumeInterpolation"><option value="nearest">Sharp (nearest voxel)</option><option value="linear">Smooth (linear)</option></select></label>
-        <h3>RT Structure Set</h3><div id="roiControls" aria-label="ROI visibility settings"></div>
+        <h3>ROI annotations</h3><div id="roiControls" aria-label="ROI visibility settings"></div>
         <label>3D ROI opacity <input id="roiOpacity" type="range" min="0" max="100" value="60"></label>
         <h3>Clipping range</h3>
         <label>X min <input id="clipX0" type="range" min="0" max="100" value="0"></label>
@@ -122,7 +125,7 @@ async function sendSlice(panel, cancellation, index, pixels) {
   });
 }
 
-async function loadSeries(panel, records, rtFiles, cancellation) {
+async function loadSeries(panel, records, rtFiles, cancellation, xmlFiles = []) {
   let total;
   try {
     const images = [];
@@ -148,6 +151,30 @@ async function loadSeries(panel, records, rtFiles, cancellation) {
         }
       }
     }
+    const roiWarnings = [];
+    for (const file of xmlFiles) {
+      if (cancellation.cancelled) return;
+      try {
+        if ((await fs.stat(file)).size > MAX_XML_BYTES)
+          throw new DicomError('LIDC_XML', 'Annotation XML exceeds the 16 MiB limit.');
+        const annotations = parseLidcXml(await fs.readFile(file), volume.images);
+        rois.push(...annotations.rois);
+        roiWarnings.push(...annotations.warnings);
+      } catch (error) {
+        roiWarnings.push(`Annotation XML skipped: ${safeError(error)}`);
+      }
+    }
+    // Visibility controls and mask bits must have unique identifiers across files.
+    const roiNumbers = new Set();
+    let nextRoiNumber = 1;
+    for (const roi of rois) {
+      if (roiNumbers.has(roi.number)) {
+        while (roiNumbers.has(nextRoiNumber)) nextRoiNumber++;
+        roi.sourceNumber = roi.number;
+        roi.number = nextRoiNumber;
+      }
+      roiNumbers.add(roi.number);
+    }
     total = volume.rows * volume.columns * volume.images.length;
     if (total > MAX_VOXELS) throw new DicomError('MEMORY', 'The volume exceeds the size limit.');
     if (cancellation.cancelled) return;
@@ -155,7 +182,7 @@ async function loadSeries(panel, records, rtFiles, cancellation) {
       rows: volume.rows, columns: volume.columns, count: volume.images.length,
       spacing: volume.spacing, sliceSpacing: volume.sliceSpacing,
       origin: volume.origin, row: volume.row, column: volume.column, normal: volume.normal,
-      seriesNumber: volume.images[0].seriesNumber || '—', rois
+      seriesNumber: volume.images[0].seriesNumber || '—', rois, roiWarnings
     };
     await panel.webview.postMessage({ type: 'start', meta });
     for (let i = 0; i < volume.images.length; i++) {
@@ -317,7 +344,7 @@ async function loadFileSeries(panel, file, cancellation, show) {
       group.some(record => normalized(record.file) === normalized(file)));
     if (!records) throw new DicomError('SERIES', 'No supported CT series found for this image.');
     if (records.length < 2) throw new DicomError('SERIES', '3D display requires at least two slices.');
-    show((target, loadCancellation) => loadSeries(target, records, found.rtFiles, loadCancellation));
+    show((target, loadCancellation) => loadSeries(target, records, found.rtFiles, loadCancellation, found.xmlFiles));
   } catch (error) {
     if (!cancellation.cancelled) {
       cancellation.seriesRequested = false;
@@ -358,7 +385,7 @@ async function openSeries(context) {
     vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true,
       localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media')] });
   currentPanel = panel;
-  showViewer(panel, context, (target, cancellation) => loadSeries(target, choice.records, found.rtFiles, cancellation));
+  showViewer(panel, context, (target, cancellation) => loadSeries(target, choice.records, found.rtFiles, cancellation, found.xmlFiles));
 }
 
 function showEditorError(panel, message) {

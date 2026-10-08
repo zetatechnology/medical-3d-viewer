@@ -175,9 +175,10 @@
     for (const roi of meta.rois) {
       if (!visibleRois.has(roi.number)) continue;
       ctx.strokeStyle = roiColor(roi);
-      const sections = [];
+      const sections = [[], []];
       for (const contour of roi.contours) {
         const points = contour.points;
+        ctx.setLineDash(contour.exclusion ? [4 * ratio, 3 * ratio] : []);
         if (plane.fixed === 2) {
           let drawn = false;
           ctx.beginPath();
@@ -193,12 +194,18 @@
         } else {
           for (const [a, b] of contourIntersections(points, plane, fixed)) {
             const [left, right] = a[plane.x] <= b[plane.x] ? [a, b] : [b, a];
-            sections.push({ left, right, center: (left[plane.x] + right[plane.x]) / 2,
+            sections[contour.exclusion ? 1 : 0].push({ left, right, center: (left[plane.x] + right[plane.x]) / 2,
               width: right[plane.x] - left[plane.x], height: (left[plane.y] + right[plane.y]) / 2 });
           }
         }
       }
-      if (plane.fixed !== 2) drawCrossSectionRois(ctx, sections, plane, xy);
+      if (plane.fixed !== 2) {
+        for (let exclusion = 0; exclusion < 2; exclusion++) {
+          ctx.setLineDash(exclusion ? [4 * ratio, 3 * ratio] : []);
+          drawCrossSectionRois(ctx, sections[exclusion], plane, xy);
+        }
+      }
+      ctx.setLineDash([]);
     }
   }
 
@@ -573,7 +580,7 @@
         status('Building 3D ROI masks');
         showProgress();
         roiMask = window.RoiMask.buildMask(meta);
-        const maskInfo = [];
+        const maskInfo = [...(meta.roiWarnings || [])];
         if (meta.rois.length > window.RoiMask.MAX_ROIS)
           maskInfo.push(`3D masks show the first ${window.RoiMask.MAX_ROIS} ROIs.`);
         if (roiMask?.skippedContours)

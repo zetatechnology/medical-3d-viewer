@@ -43,5 +43,6 @@
   },
   "scripts": {
     "test": "node --test"
-  }
+  },
+  "dependencies": {"fast-xml-parser":"^5.11.2"}
 }

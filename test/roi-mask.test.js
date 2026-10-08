@@ -33,3 +33,16 @@ test('skips contours that are not parallel to CT slices', () => {
   assert.ok(result.data.every(value => value === 0));
   assert.equal(MAX_ROIS, 8);
 });
+
+
+test('exclusions remove only their own ROI bit regardless of contour order', () => {
+  const hole = { ...square(0.6, 0.6, 1.4, 1.4, 0), exclusion: true };
+  const result = buildMask({ ...meta, rois: [
+    { number: 1, contours: [hole, square(-0.4, -0.4, 2.4, 2.4, 0)] },
+    { number: 2, contours: [square(-0.4, -0.4, 2.4, 2.4, 0)] }
+  ] });
+  assert.equal(result.data[4], 2);
+  assert.equal(result.data[0], 3);
+  assert.equal(result.data[13], 0);
+  assert.equal(result.skippedContours, 0);
+});
