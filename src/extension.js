@@ -4,7 +4,7 @@ const vscode = require('vscode');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { DicomError, readHeader, parseDicom, validateImage, validateSeries, decodePixels } = require('./dicom');
+const { DicomError, readHeader, parseDicom, validateImage, validateSeries, decodePixels, CT_IMAGE } = require('./dicom');
 const { RTSTRUCT, parseRtstruct } = require('./rtstruct');
 const { parseLidcXml, MAX_XML_BYTES } = require('./lidc');
 const { NiftiError, readNiftiFile, scanNiftiRange, decodeNiftiSlice } = require('./nifti');
@@ -13,7 +13,6 @@ const MAX_FILES = 10000;
 const MAX_VOXELS = 140_000_000;
 const MAX_NIFTI_BYTES = MAX_VOXELS * 8 + 4096;
 const MAX_IMAGE_BYTES = 64 * 1024 * 1024;
-let currentPanel;
 const activeLoads = new Set();
 
 async function listFiles(root, token) {
@@ -249,10 +248,10 @@ function imagePanelHtml(panel, extensionUri) {
     <main>
       <section aria-label="Single DICOM image">
         <div class="panelTitle"><h2>2D image <small id="imageZoom">100%</small></h2><button id="resetImage" type="button">Reset view</button></div>
-        <canvas id="image" tabindex="0" aria-label="Single CT image. Scroll or use plus and minus to zoom; drag to pan." title="Scroll: zoom / Drag: pan"></canvas>
+        <canvas id="image" tabindex="0" aria-label="Single DICOM image. Scroll or use plus and minus to zoom; drag to pan." title="Scroll: zoom / Drag: pan"></canvas>
       </section>
       <aside aria-label="Display settings"><h2>Display settings</h2>
-        <button id="loadSeries" type="button" disabled>Load series in 3D</button>
+        <button id="loadSeries" type="button" hidden disabled>Load series in 3D</button>
         <label>Preset <select id="preset"><option value="dicom">DICOM window</option><option value="soft">Soft tissue</option><option value="bone">Bone</option><option value="lung">Lung</option></select></label>
         <label>Window level <input id="level" type="number" value="40" step="1"></label>
         <label>Window width <input id="width" type="number" value="400" min="1" step="1"></label>
@@ -274,17 +273,31 @@ async function loadImage(panel, file, cancellation) {
     }
     const pixels = decodePixels(data, image);
     if (cancellation.cancelled) return;
-    const spacing = image.spacing?.length === 2 && image.spacing.every(v => Number.isFinite(v) && v > 0)
-      ? image.spacing : null;
+    const spacing = [image.spacing, image.imagerSpacing].find(values =>
+      values?.length === 2 && values.every(v => Number.isFinite(v) && v > 0)) || null;
+    const canLoadSeries = image.sopClass === CT_IMAGE && image.modality === 'CT';
     const level = image.windowCenter?.[0];
     const width = image.windowWidth?.[0];
-    const displayWindow = Number.isFinite(level) && Number.isFinite(width) && width > 0
-      ? { level, width } : { level: 40, width: 400 };
+    let displayWindow = Number.isFinite(level) && Number.isFinite(width) && width > 0
+      ? { level, width } : null;
+    if (!canLoadSeries) {
+      let minimum = Infinity, maximum = -Infinity;
+      for (const pixel of pixels) { minimum = Math.min(minimum, pixel); maximum = Math.max(maximum, pixel); }
+      // Some radiographs carry CT window values that clip almost the entire image.
+      const overlap = displayWindow ? Math.max(0, Math.min(maximum, level + width / 2) -
+        Math.max(minimum, level - width / 2)) : 0;
+      if (!displayWindow || overlap < (maximum - minimum) * .1) {
+        displayWindow = { level: (minimum + maximum) / 2, width: Math.max(maximum - minimum, 1) };
+      }
+    }
+    displayWindow ||= { level: 40, width: 400 };
     const delivered = await panel.webview.postMessage({ type: 'image', meta: {
       rows: image.rows, columns: image.columns, spacing,
-      seriesNumber: image.seriesNumber || '—', displayWindow
+      seriesNumber: image.seriesNumber || '—', modality: image.modality || 'Unknown',
+      photometric: image.photometric, canLoadSeries, displayWindow
     }, pixels: Buffer.from(pixels.buffer, pixels.byteOffset, pixels.byteLength).toString('base64') });
     cancellation.imageLoaded = delivered;
+    cancellation.canLoadSeries = canLoadSeries;
   } catch (error) {
     if (!cancellation.cancelled) await panel.webview.postMessage({ type: 'error', text: safeError(error) });
   }
@@ -298,11 +311,10 @@ function showViewer(panel, context, loader, html = panelHtml, seriesLoader) {
     cancellation.ack?.(false);
     cancellation.ack = null;
     activeLoads.delete(cancellation);
-    if (currentPanel === panel) currentPanel = undefined;
   });
   panel.webview.onDidReceiveMessage(message => {
     if (message?.type === 'ready') void loader(panel, cancellation);
-    if (message?.type === 'loadSeries' && seriesLoader && cancellation.imageLoaded &&
+    if (message?.type === 'loadSeries' && seriesLoader && cancellation.imageLoaded && cancellation.canLoadSeries &&
         !cancellation.cancelled && !cancellation.seriesRequested) {
       cancellation.seriesRequested = true;
       void seriesLoader(panel, cancellation, nextLoader => {
@@ -353,41 +365,6 @@ async function loadFileSeries(panel, file, cancellation, show) {
   }
 }
 
-async function openSeries(context) {
-  const selected = await vscode.window.showOpenDialog({ canSelectFiles: false, canSelectFolders: true,
-    canSelectMany: false, openLabel: 'Open CT series folder' });
-  if (!selected?.length) return;
-  let found;
-  try {
-    found = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification,
-      title: 'Searching for DICOM series', cancellable: true },
-    (progress, token) => findSeries(selected[0].fsPath, progress, token));
-  } catch (error) {
-    vscode.window.showErrorMessage(safeError(error));
-    return;
-  }
-  if (!found) return;
-  if (!found.groups.size) {
-    vscode.window.showWarningMessage(found?.unsupported
-      ? 'No supported CT series found. Check for unsupported or damaged files.'
-      : 'No DICOM series found.');
-    return;
-  }
-  const choices = [...found.groups.values()].map(records => ({
-    label: `Series ${records[0].meta.seriesNumber || '—'} — ${records.length} slices`,
-    description: records[0].meta.modality || 'Unknown',
-    records
-  }));
-  const choice = await vscode.window.showQuickPick(choices, { placeHolder: 'Select a CT series to display' });
-  if (!choice) return;
-  currentPanel?.dispose();
-  const panel = vscode.window.createWebviewPanel('dicom3d.viewer', 'Medical 3D Viewer',
-    vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true,
-      localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media')] });
-  currentPanel = panel;
-  showViewer(panel, context, (target, cancellation) => loadSeries(target, choice.records, found.rtFiles, cancellation, found.xmlFiles));
-}
-
 function showEditorError(panel, message) {
   const escaped = message.replace(/[&<>"']/g, char => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -414,17 +391,10 @@ async function openFileViewer(context, document, panel, token) {
 }
 
 function activate(context) {
-  context.subscriptions.push(vscode.commands.registerCommand('dicom3d.openSeries', () => openSeries(context)));
   context.subscriptions.push(vscode.window.registerCustomEditorProvider('dicom3d.seriesEditor', {
     openCustomDocument: uri => ({ uri, dispose() {} }),
     resolveCustomEditor: (document, panel, token) => openFileViewer(context, document, panel, token)
   }, { webviewOptions: { enableScripts: true, retainContextWhenHidden: true } }));
-  const openButton = vscode.window.createStatusBarItem('dicom3d.openSeries', vscode.StatusBarAlignment.Left, 100);
-  openButton.text = '$(folder-opened) Open CT';
-  openButton.tooltip = 'Select a folder containing a DICOM CT series';
-  openButton.command = 'dicom3d.openSeries';
-  openButton.show();
-  context.subscriptions.push(openButton);
 }
 
 function deactivate() {

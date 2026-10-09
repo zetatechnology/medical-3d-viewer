@@ -31,7 +31,8 @@
       const source = bitmap.getContext('2d');
       const image = source.createImageData(meta.columns, meta.rows);
       for (let i = 0; i < pixels.length; i++) {
-        const gray = Math.max(0, Math.min(255, Math.round((pixels[i] - win.level + win.width / 2) * 255 / win.width)));
+        let gray = Math.max(0, Math.min(255, Math.round((pixels[i] - win.level + win.width / 2) * 255 / win.width)));
+        if (meta.photometric === 'MONOCHROME1') gray = 255 - gray;
         image.data[i * 4] = image.data[i * 4 + 1] = image.data[i * 4 + 2] = gray;
         image.data[i * 4 + 3] = 255;
       }
@@ -67,7 +68,7 @@
 
   function showMeta() {
     const values = [
-      ['Format', 'DICOM CT'], ['Dimensions', `${meta.columns} × ${meta.rows}`],
+      ['Format', `DICOM ${meta.modality}`], ['Dimensions', `${meta.columns} × ${meta.rows}`],
       ['Pixel spacing', meta.spacing ? `${meta.spacing[0]} × ${meta.spacing[1]} mm` : 'Unknown (square pixels)'],
       ['Series number', meta.seriesNumber]
     ];
@@ -95,9 +96,10 @@
         $('width').value = String(meta.displayWindow.width);
         dirty = true;
         showMeta(); resetView();
-        status('Ready'); $('cancelLoad').disabled = true; $('loadSeries').disabled = false;
+        status('Ready'); $('cancelLoad').disabled = true;
+        $('loadSeries').hidden = !meta.canLoadSeries; $('loadSeries').disabled = !meta.canLoadSeries;
       } else if (message.type === 'seriesResult') {
-        status(message.text); $('loadSeries').disabled = false;
+        status(message.text); $('loadSeries').disabled = !meta?.canLoadSeries;
       } else if (message.type === 'error') {
         pixels = null; status(message.text); $('cancelLoad').disabled = true; requestRender();
       }

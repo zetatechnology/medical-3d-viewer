@@ -31,22 +31,25 @@ function implicitElement(group, id, value) {
 }
 
 function sample(options = {}) {
-  const pixels = Buffer.alloc(8);
-  [0, 100, 2048, 4095].forEach((value, i) => pixels.writeUInt16LE(value, i * 2));
+  const bitsAllocated = options.bitsAllocated ?? 16;
+  const bitsStored = options.bitsStored ?? 12;
+  const pixels = Buffer.alloc(4 * bitsAllocated / 8);
+  (options.pixels || [0, 100, 2048, 4095]).forEach((value, i) =>
+    bitsAllocated === 8 ? pixels.writeUInt8(value, i) : pixels.writeUInt16LE(value, i * 2));
   const elements = [
-    element(0x0008, 0x0016, 'UI', CT_IMAGE),
-    element(0x0008, 0x0060, 'CS', 'CT'),
+    element(0x0008, 0x0016, 'UI', options.sopClass || CT_IMAGE),
+    element(0x0008, 0x0060, 'CS', options.modality || 'CT'),
     element(0x0008, 0x0018, 'UI', `1.2.3.4.${(options.z ?? 0) + 1}`),
     element(0x0020, 0x000d, 'UI', '1.2.3'),
     element(0x0020, 0x000e, 'UI', '1.2.3.4'),
     element(0x0020, 0x0032, 'DS', `0\\0\\${options.z ?? 0}`),
     element(0x0020, 0x0037, 'DS', '1\\0\\0\\0\\1\\0'),
-    element(0x0028, 0x0004, 'CS', 'MONOCHROME2'),
+    element(0x0028, 0x0004, 'CS', options.photometric || 'MONOCHROME2'),
     element(0x0028, 0x0030, 'DS', '0.7\\0.8'),
     us(0x0028, 0x0002, 1), us(0x0028, 0x0010, 2), us(0x0028, 0x0011, 2),
-    us(0x0028, 0x0100, 16), us(0x0028, 0x0101, 12), us(0x0028, 0x0102, 11),
-    us(0x0028, 0x0103, 1),
-    element(0x0028, 0x1052, 'DS', '-1024'), element(0x0028, 0x1053, 'DS', '2'),
+    us(0x0028, 0x0100, bitsAllocated), us(0x0028, 0x0101, bitsStored), us(0x0028, 0x0102, bitsStored - 1),
+    us(0x0028, 0x0103, options.pixelRepresentation ?? 1),
+    element(0x0028, 0x1052, 'DS', options.intercept ?? '-1024'), element(0x0028, 0x1053, 'DS', options.slope ?? '2'),
     ...(options.window ? [element(0x0028, 0x1050, 'DS', options.window.level),
       element(0x0028, 0x1051, 'DS', options.window.width)] : []),
     ...(options.frames ? [element(0x0028, 0x0008, 'IS', options.frames)] : []),
@@ -115,12 +118,27 @@ test('validates a single 2D CT image without reconstruction geometry', () => {
 
 test('2D validation rejects unsupported pixels, multiple frames and incomplete pixel data', () => {
   const meta = parseDicom(sample());
-  for (const changes of [{ photometric: 'RGB' }, { modality: 'MR' }, { rows: 0 },
-    { bitsAllocated: 8 }, { pixelLength: 2 }, { slope: [1, 2] }, { numberOfFrames: '2' }]) {
+  for (const changes of [{ photometric: 'RGB' }, { samplesPerPixel: 3 }, { rows: 0 },
+    { bitsAllocated: 32 }, { bitsStored: 17 }, { highBit: 12 }, { pixelLength: 2 }, { slope: [1, 2] }, { numberOfFrames: '2' }]) {
     assert.throws(() => validateImage({ ...meta, ...changes }), DicomError);
   }
   assert.throws(() => validateSeries([parseDicom(sample({ frames: '2' })), parseDicom(sample({ z: 1 }))]),
     error => error.code === 'SOP_CLASS');
+});
+
+test('2D decoding accepts other modalities, 8/14/16 bits and both monochrome polarities', () => {
+  for (const bitsStored of [8, 14, 16]) {
+    for (const pixelRepresentation of [0, 1]) {
+      const maximum = 2 ** bitsStored - 1;
+      const data = sample({ modality: 'DX', sopClass: '1.2.840.10008.5.1.4.1.1.1.1',
+        bitsAllocated: bitsStored === 8 ? 8 : 16, bitsStored, pixelRepresentation,
+        pixels: [0, 1, 2 ** (bitsStored - 1), maximum], slope: 1, intercept: 0, photometric: 'MONOCHROME1' });
+      const meta = validateImage(parseDicom(data));
+      assert.deepEqual([...decodePixels(data, meta)], pixelRepresentation === 0 ?
+        [0, 1, 2 ** (bitsStored - 1), maximum] : [0, 1, -(2 ** (bitsStored - 1)), -1]);
+      assert.throws(() => validateSeries([meta, meta]), error => error.code === 'SOP_CLASS');
+    }
+  }
 });
 
 test('parses multiple DICOM windows and frame count', () => {
@@ -139,7 +157,7 @@ function extensionHarness(data = sample(), options = {}) {
   const files = { '/ct/clicked.dcm': data, '/ct/other.dcm': sample({ z: 1 }) };
   if (options.single) delete files['/ct/other.dcm'];
   Object.assign(files, options.files || {});
-  const reads = [], messages = [], scans = [], commands = new Map();
+  const reads = [], messages = [], scans = [];
   let provider, listener, dispose;
   const panel = {
     onDidDispose(callback) { dispose = callback; },
@@ -154,16 +172,11 @@ function extensionHarness(data = sample(), options = {}) {
     }
   };
   const vscode = {
-    Uri: { joinPath: (...parts) => parts.join('/') }, ViewColumn: { Active: 1 },
-    StatusBarAlignment: { Left: 1 }, ProgressLocation: { Notification: 1 },
-    commands: { registerCommand(name, callback) { commands.set(name, callback); return {}; } },
+    Uri: { joinPath: (...parts) => parts.join('/') },
+    ProgressLocation: { Notification: 1 },
     window: {
       registerCustomEditorProvider(name, value) { provider = value; return {}; },
-      createStatusBarItem: () => ({ show() {} }),
-      showOpenDialog: async () => [{ fsPath: '/ct' }],
-      showQuickPick: async choices => choices[0],
       withProgress: async (settings, callback) => callback({ report() {} }, { isCancellationRequested: options.cancelSearch === true }),
-      createWebviewPanel: () => panel,
       showErrorMessage: message => { throw new Error(message); }
     }
   };
@@ -189,7 +202,7 @@ function extensionHarness(data = sample(), options = {}) {
     }
   }, { filename: file });
   module.exports.activate({ subscriptions: [], extensionUri: '/extension' });
-  return { panel, reads, messages, scans, commands,
+  return { panel, reads, messages, scans,
     open: name => provider.resolveCustomEditor({ uri: { scheme: 'file', fsPath: name } }, panel, { isCancellationRequested: false }),
     send: message => listener(message), dispose: () => dispose() };
 }
@@ -202,6 +215,23 @@ async function waitForMessage(harness, type) {
   }
   assert.fail(`No ${type} message received`);
 }
+
+test('radiographs use auto contrast for incompatible windows and reject 3D requests', async () => {
+  for (const window of [undefined, { level: '-600', width: '1600' }, { level: '7500', width: '15000' }]) {
+    const harness = extensionHarness(sample({ modality: 'DX', sopClass: '1.2.840.10008.5.1.4.1.1.1.1',
+      bitsStored: 14, pixelRepresentation: 0, pixels: [0, 5000, 10000, 15000], slope: 1, intercept: 0, window }));
+    await harness.open('/ct/clicked.dcm'); harness.send({ type: 'ready' });
+    const image = await waitForMessage(harness, 'image');
+    assert.equal(image.meta.modality, 'DX');
+    assert.equal(image.meta.canLoadSeries, false);
+    assert.equal(image.meta.displayWindow.level, 7500);
+    assert.equal(image.meta.displayWindow.width, 15000);
+    harness.send({ type: 'loadSeries' });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(harness.scans.length, 0);
+    harness.dispose();
+  }
+});
 
 test('clicking DICOM reads only that file and sends a 2D image with the first DICOM window', async () => {
   const harness = extensionHarness(sample({ window: { level: '55\\300', width: '500\\1500' } }));
@@ -243,19 +273,6 @@ test('cancel before file read suppresses image delivery', async () => {
   harness.dispose();
 });
 
-test('Open CT still scans and loads a full series through the 3D viewer', async () => {
-  const harness = extensionHarness();
-  await harness.commands.get('dicom3d.openSeries')();
-  assert.match(harness.panel.webview.html, /roi-mask.js/);
-  harness.send({ type: 'ready' });
-  await waitForMessage(harness, 'complete');
-  const start = harness.messages.find(message => message.type === 'start');
-  assert.equal(start.meta.count, 2);
-  assert.equal(harness.messages.filter(message => message.type === 'slice').length, 2);
-  assert.ok(harness.reads.some(name => name.replace(/\\/g, '/') === '/ct/other.dcm'));
-  harness.dispose();
-});
-
 test('NIfTI files continue to use the volume viewer', async () => {
   const harness = extensionHarness();
   await harness.open('/ct/volume.NII.GZ');
@@ -279,6 +296,8 @@ test('2D series button loads the selected series in the same panel and ignores r
   assert.equal(harness.scans.length, 1);
   harness.send({ type: 'ready' }); await waitForMessage(harness, 'complete');
   assert.equal(harness.messages.find(message => message.type === 'start').meta.count, 2);
+  assert.equal(harness.messages.filter(message => message.type === 'slice').length, 2);
+  assert.ok(harness.reads.some(name => name.replace(/\\/g, '/') === '/ct/other.dcm'));
   harness.dispose();
 });
 
@@ -311,28 +330,28 @@ test('disposing the panel during series search prevents switching to 3D', async 
 });
 
 
-test('Open CT and the 2D series button discover LIDC XML and deliver matching ROIs', async () => {
+test('the 2D series button discovers LIDC XML and delivers matching ROIs', async () => {
   const annotations = `<LidcReadMessage><ResponseHeader><StudyInstanceUID>1.2.3</StudyInstanceUID><SeriesInstanceUid>1.2.3.4</SeriesInstanceUid></ResponseHeader><readingSession><unblindedReadNodule><noduleID>001</noduleID><roi><imageSOP_UID>1.2.3.4.1</imageSOP_UID><inclusion>TRUE</inclusion><edgeMap><xCoord>0</xCoord><yCoord>0</yCoord></edgeMap><edgeMap><xCoord>1</xCoord><yCoord>0</yCoord></edgeMap><edgeMap><xCoord>1</xCoord><yCoord>1</yCoord></edgeMap></roi></unblindedReadNodule></readingSession></LidcReadMessage>`;
-  for (const viaButton of [false, true]) {
-    const harness = extensionHarness(sample(), { files: { '/ct/annotations.XML': Buffer.from(annotations) } });
-    if (viaButton) {
-      await harness.open('/ct/clicked.dcm'); harness.send({ type: 'ready' });
-      await waitForMessage(harness, 'image'); harness.send({ type: 'loadSeries' });
-      for (let i = 0; i < 20 && !harness.panel.webview.html.includes('roi-mask.js'); i++)
-        await new Promise(resolve => setImmediate(resolve));
-    } else await harness.commands.get('dicom3d.openSeries')();
-    harness.send({ type: 'ready' });
-    const start = await waitForMessage(harness, 'start');
-    assert.equal(start.meta.rois.length, 1);
-    assert.equal(start.meta.rois[0].name, 'LIDC Reader 1: 001');
-    assert.ok(harness.reads.some(file => file.endsWith('annotations.XML')));
-    await waitForMessage(harness, 'complete'); harness.dispose();
-  }
+  const harness = extensionHarness(sample(), { files: { '/ct/annotations.XML': Buffer.from(annotations) } });
+  await harness.open('/ct/clicked.dcm'); harness.send({ type: 'ready' });
+  await waitForMessage(harness, 'image'); harness.send({ type: 'loadSeries' });
+  for (let i = 0; i < 20 && !harness.panel.webview.html.includes('roi-mask.js'); i++)
+    await new Promise(resolve => setImmediate(resolve));
+  harness.send({ type: 'ready' });
+  const start = await waitForMessage(harness, 'start');
+  assert.equal(start.meta.rois.length, 1);
+  assert.equal(start.meta.rois[0].name, 'LIDC Reader 1: 001');
+  assert.ok(harness.reads.some(file => file.endsWith('annotations.XML')));
+  await waitForMessage(harness, 'complete'); harness.dispose();
 });
 
 test('malformed annotation XML reports a warning without preventing CT loading', async () => {
   const harness = extensionHarness(sample(), { files: { '/ct/annotations.xml': Buffer.from('<broken>') } });
-  await harness.commands.get('dicom3d.openSeries')(); harness.send({ type: 'ready' });
+  await harness.open('/ct/clicked.dcm'); harness.send({ type: 'ready' });
+  await waitForMessage(harness, 'image'); harness.send({ type: 'loadSeries' });
+  for (let i = 0; i < 20 && !harness.panel.webview.html.includes('roi-mask.js'); i++)
+    await new Promise(resolve => setImmediate(resolve));
+  harness.send({ type: 'ready' });
   const start = await waitForMessage(harness, 'start');
   assert.equal(start.meta.rois.length, 0);
   assert.match(start.meta.roiWarnings[0], /Malformed annotation XML/);

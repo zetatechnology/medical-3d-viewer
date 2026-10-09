@@ -41,10 +41,11 @@ function viewer() {
     element, draws, bitmaps, messages, get webglCalls() { return webglCalls; },
     flush() { while (frames.length) frames.shift()(); },
     send(message) { messageHandler({ data: message }); },
-    load(spacing = [2, 1]) {
+    load(spacing = [2, 1], metadata = {}) {
       const pixels = new Float32Array([-200, 0, 100, 200]);
       messageHandler({ data: { type: 'image', pixels: Buffer.from(pixels.buffer).toString('base64'),
-        meta: { rows: 2, columns: 2, spacing, seriesNumber: '1', displayWindow: { level: 0, width: 400 } } } });
+        meta: { rows: 2, columns: 2, spacing, seriesNumber: '1', modality: 'CT', canLoadSeries: true,
+          displayWindow: { level: 0, width: 400 }, ...metadata } } });
       this.flush();
     }
   };
@@ -100,6 +101,16 @@ test('cancel ignores an image arriving after cancellation', () => {
   assert.equal(view.draws.length, 0);
   assert.equal(view.messages.at(-1).type, 'cancel');
   assert.equal(view.element('status').textContent, 'Loading cancelled');
+});
+
+test('MONOCHROME1 reverses grayscale and radiographs cannot request 3D loading', () => {
+  const view = viewer();
+  view.load(null, { modality: 'DX', photometric: 'MONOCHROME1', canLoadSeries: false });
+  assert.deepEqual([...view.bitmaps[0].data.filter((_, i) => i % 4 === 0)], [255, 127, 64, 0]);
+  assert.equal(view.element('loadSeries').hidden, true);
+  assert.equal(view.element('loadSeries').disabled, true);
+  view.element('loadSeries').handlers.click();
+  assert.equal(view.messages.some(message => message.type === 'loadSeries'), false);
 });
 
 test('series button sends one request and search failure preserves the image and allows retry', () => {

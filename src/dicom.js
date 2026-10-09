@@ -100,7 +100,7 @@ function parseDicom(data, options = {}) {
   ]);
   const numberTags = new Map([
     [0x00200032, 'position'], [0x00200037, 'orientation'], [0x00280030, 'spacing'],
-    [0x00281052, 'intercept'], [0x00281053, 'slope']
+    [0x00281052, 'intercept'], [0x00281053, 'slope'], [0x00181164, 'imagerSpacing']
   ]);
   const windowTags = new Map([[0x00281050, 'windowCenter'], [0x00281051, 'windowWidth']]);
   const scalarTags = new Map([
@@ -138,18 +138,18 @@ function norm(v) { return Math.hypot(...v); }
 function close(a, b, tolerance) { return Math.abs(a - b) <= tolerance; }
 
 function validateImage(image) {
-  if (image.sopClass !== CT_IMAGE || image.modality !== 'CT' ||
-      (image.numberOfFrames !== undefined && Number(image.numberOfFrames) !== 1)) {
-    throw new DicomError('SOP_CLASS', 'Only single-frame CT images are supported.');
+  if (image.numberOfFrames !== undefined && Number(image.numberOfFrames) !== 1) {
+    throw new DicomError('SOP_CLASS', 'Only single-frame images are supported in the 2D viewer.');
   }
-  if (image.photometric !== 'MONOCHROME2' || image.samplesPerPixel !== 1 || image.bitsAllocated !== 16 ||
-      ![12, 16].includes(image.bitsStored) || image.highBit !== image.bitsStored - 1 ||
+  if (!['MONOCHROME1', 'MONOCHROME2'].includes(image.photometric) || image.samplesPerPixel !== 1 ||
+      ![8, 16].includes(image.bitsAllocated) || !Number.isInteger(image.bitsStored) ||
+      image.bitsStored < 1 || image.bitsStored > image.bitsAllocated || image.highBit !== image.bitsStored - 1 ||
       ![0, 1].includes(image.pixelRepresentation)) throw new DicomError('PIXEL_FORMAT', 'Unsupported pixel format.');
   if (!image.rows || !image.columns ||
       (image.slope && image.slope.length !== 1) || (image.intercept && image.intercept.length !== 1)) {
     throw new DicomError('METADATA', 'Image dimensions or rescale metadata are invalid.');
   }
-  if (image.pixelOffset < 0 || image.pixelLength < image.rows * image.columns * 2) {
+  if (image.pixelOffset < 0 || image.pixelLength < image.rows * image.columns * image.bitsAllocated / 8) {
     throw new DicomError('PIXEL_DATA', 'Pixel Data is incomplete.');
   }
   return image;
@@ -160,6 +160,12 @@ function validateSeries(images) {
   const first = images[0];
   for (const image of images) {
     validateImage(image);
+    if (image.sopClass !== CT_IMAGE || image.modality !== 'CT') {
+      throw new DicomError('SOP_CLASS', 'Only CT series are supported in the 3D viewer.');
+    }
+    if (image.photometric !== 'MONOCHROME2' || image.bitsAllocated !== 16 || ![12, 16].includes(image.bitsStored)) {
+      throw new DicomError('PIXEL_FORMAT', 'Unsupported CT pixel format for 3D display.');
+    }
     if (!image.seriesUid || !image.studyUid || !image.position || image.position.length !== 3 ||
         !image.orientation || image.orientation.length !== 6 || !image.spacing || image.spacing.length !== 2 ||
         image.spacing.some(v => v <= 0)) {
@@ -199,14 +205,16 @@ function validateSeries(images) {
 
 function decodePixels(data, meta) {
   const count = meta.rows * meta.columns;
-  if (meta.pixelOffset + count * 2 > data.length) throw new DicomError('PIXEL_DATA', 'Pixel Data is truncated.');
+  const bytesPerPixel = meta.bitsAllocated / 8;
+  if (meta.pixelOffset + count * bytesPerPixel > data.length) throw new DicomError('PIXEL_DATA', 'Pixel Data is truncated.');
   const output = new Float32Array(count);
   const mask = (1 << meta.bitsStored) - 1;
   const sign = 1 << (meta.bitsStored - 1);
   const slope = meta.slope?.[0] ?? 1;
   const intercept = meta.intercept?.[0] ?? 0;
   for (let i = 0; i < count; i++) {
-    let raw = data.readUInt16LE(meta.pixelOffset + i * 2) & mask;
+    let raw = (bytesPerPixel === 1 ? data.readUInt8(meta.pixelOffset + i) :
+      data.readUInt16LE(meta.pixelOffset + i * 2)) & mask;
     if (meta.pixelRepresentation === 1 && (raw & sign)) raw -= (1 << meta.bitsStored);
     output[i] = raw * slope + intercept;
   }

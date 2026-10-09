@@ -15,7 +15,7 @@
   },
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Visualization"],
-  "activationEvents": ["onCommand:dicom3d.openSeries", "onCustomEditor:dicom3d.seriesEditor", "onStartupFinished"],
+  "activationEvents": ["onCustomEditor:dicom3d.seriesEditor"],
   "main": "./src/extension.js",
   "contributes": {
     "customEditors": [
@@ -36,9 +36,6 @@
         ],
         "priority": "default"
       }
-    ],
-    "commands": [
-      { "command": "dicom3d.openSeries", "title": "Medical 3D Viewer: Open DICOM CT Series" }
     ]
   },
   "scripts": {
