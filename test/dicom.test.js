@@ -166,7 +166,7 @@ function extensionHarness(data = sample(), options = {}) {
       onDidReceiveMessage(callback) { listener = callback; },
       async postMessage(message) {
         messages.push(message);
-        if (message.type === 'slice') listener({ type: 'sliceAck', ok: true });
+        if (message.type === 'slice' || message.type === 'labelSlice') listener({ type: 'sliceAck', ok: true });
         return true;
       }
     }
@@ -176,6 +176,7 @@ function extensionHarness(data = sample(), options = {}) {
     ProgressLocation: { Notification: 1 },
     window: {
       registerCustomEditorProvider(name, value) { provider = value; return {}; },
+      showOpenDialog: async () => options.labelSelection,
       withProgress: async (settings, callback) => callback({ report() {} }, { isCancellationRequested: options.cancelSearch === true }),
       showErrorMessage: message => { throw new Error(message); }
     }
@@ -197,6 +198,9 @@ function extensionHarness(data = sample(), options = {}) {
     require(name) {
       if (name === 'vscode') return vscode;
       if (name === 'node:fs/promises') return fakeFs;
+      if (name === './nifti' && options.niftiVolumes) return {
+        ...realRequire(name), readNiftiFile: async name => options.niftiVolumes[name]
+      };
       if (name === './dicom') return { ...realRequire(name), readHeader: async name => parseDicom(files[name.replace(/\\/g, '/')]) };
       return realRequire(name);
     }
@@ -356,4 +360,36 @@ test('malformed annotation XML reports a warning without preventing CT loading',
   assert.equal(start.meta.rois.length, 0);
   assert.match(start.meta.roiWarnings[0], /Malformed annotation XML/);
   await waitForMessage(harness, 'complete'); harness.dispose();
+});
+
+test('NIfTI label dialog streams mask slices and rejects mismatched geometry without a volume error', async () => {
+  const data = Buffer.alloc(360);
+  data.writeInt32LE(348, 0); data.writeInt16LE(3, 40);
+  for (const offset of [42, 44, 46]) data.writeInt16LE(2, offset);
+  data.writeInt16LE(2, 70); data.writeInt16LE(8, 72);
+  data.writeFloatLE(352, 108); data.write('n+1\0', 344, 4, 'ascii');
+  Buffer.from([0, 1, 2, 1, 2, 0, 1, 0]).copy(data, 352);
+  const volume = require('../src/nifti').parseNifti(data);
+  for (const mismatch of [false, true]) {
+    const harness = extensionHarness(sample(), {
+      labelSelection: [{ scheme: 'file', fsPath: '/ct/labels.nii.gz' }],
+      niftiVolumes: { '/ct/base.nii': volume, '/ct/labels.nii.gz': mismatch ? { ...volume, origin: [10, 0, 0] } : volume }
+    });
+    await harness.open('/ct/base.nii'); harness.send({ type: 'ready' });
+    await waitForMessage(harness, 'complete'); harness.send({ type: 'loadLabels' });
+    await waitForMessage(harness, 'labelIdle');
+    assert.equal(harness.messages.some(message => message.type === 'error'), false);
+    if (mismatch) {
+      assert.match(harness.messages.find(message => message.type === 'labelError').text, /match/);
+      assert.equal(harness.messages.some(message => message.type === 'labelStart'), false);
+    } else {
+      assert.deepEqual(harness.messages.find(message => message.type === 'labelStart').rois.map(roi => roi.number), [1, 2]);
+      const slices = harness.messages.filter(message => message.type === 'labelSlice');
+      assert.equal(slices.length, 2);
+      const bytes = Buffer.from(slices[0].pixels, 'base64');
+      assert.deepEqual([0, 1, 2, 3].map(i => bytes.readUInt32LE(i * 4)), [0, 1, 2, 1]);
+      assert.ok(harness.messages.some(message => message.type === 'labelComplete'));
+    }
+    harness.dispose();
+  }
 });

@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 
 function viewer() {
-  const elements = new Map(), messages = [], dashes = [];
+  const elements = new Map(), messages = [], dashes = [], images = [], uploads = [];
   let receive;
   const gl = new Proxy({}, {
     get(target, key) {
@@ -14,6 +14,7 @@ function viewer() {
       if (/^[A-Z_0-9]+$/.test(key)) return 1;
       if (key === 'getParameter') return () => 2048;
       if (key === 'getError') return () => 0;
+      if (key === 'texImage3D') return (...args) => uploads.push(args);
       if (key === 'getShaderParameter' || key === 'getProgramParameter') return () => true;
       return () => ({});
     }
@@ -31,7 +32,7 @@ function viewer() {
       getBoundingClientRect: () => ({ width: 8, height: 8 }),
       getContext: kind => kind === 'webgl2' ? gl : {
         createImageData: (width, height) => ({ data: new Uint8ClampedArray(width * height * 4) }),
-        putImageData() {}, fillRect() {}, fillText() {},
+        putImageData(image) { images.push(image); }, fillRect() {}, fillText() {},
         beginPath() {}, moveTo() {}, lineTo() {}, closePath() {}, stroke() {},
         setLineDash(value) { dashes.push([...value]); }
       }
@@ -49,7 +50,7 @@ function viewer() {
     atob: value => Buffer.from(value, 'base64').toString('binary')
   });
   return {
-    element, messages, dashes, send: message => receive({ data: message }),
+    element, messages, dashes, images, uploads, send: message => receive({ data: message }),
     start(annotations = {}) {
       this.send({ type: 'start', meta: { rows: 2, columns: 2, count: 2, spacing: [1, 1],
         sliceSpacing: 1, origin: [0, 0, 0], row: [1, 0, 0], column: [0, 1, 0], normal: [0, 0, 1],
@@ -106,4 +107,65 @@ test('LIDC inclusion and exclusion contours render with distinct lines and warni
   assert.ok(view.dashes.some(dash => dash.length === 2));
   assert.ok(view.dashes.some(dash => dash.length === 0));
   assert.ok(view.element('roiControls').children.some(child => /no matching CT/.test(child.textContent)));
+});
+
+test('NIfTI labels blend into slices, upload mask bits, toggle visibility and clear', () => {
+  const view = viewer();
+  view.start({ modality: 'NIfTI' }); view.slice(0); view.slice(1); view.send({ type: 'complete' });
+  assert.equal(view.element('loadLabels').disabled, false);
+  view.element('loadLabels').handlers.click();
+  assert.equal(view.messages.at(-1).type, 'loadLabels');
+  view.send({ type: 'labelStart', rois: [{ number: 1000, name: 'Label 1000', color: [255, 0, 0], contours: [] }] });
+  for (let index = 0; index < 2; index++)
+    view.send({ type: 'labelSlice', index, pixels: Buffer.from(new Uint32Array([1, 1, 1, 1]).buffer).toString('base64') });
+  view.element('labelOpacity').value = '100';
+  view.send({ type: 'labelComplete' }); view.send({ type: 'labelIdle' });
+  assert.deepEqual([...view.uploads.at(-1).at(-1)], Array(8).fill(1));
+  assert.deepEqual([...view.images.at(-1).data.slice(0, 4)], [255, 0, 0, 255]);
+  const checkbox = view.element('roiControls').children[0].children[0];
+  checkbox.checked = false; checkbox.handlers.change();
+  assert.deepEqual([...view.images.at(-1).data.slice(0, 4)], [102, 102, 102, 255]);
+  view.element('clearLabels').handlers.click();
+  assert.equal(view.element('clearLabels').disabled, true);
+  assert.equal(view.uploads.at(-1).at(-1).length, 1);
+});
+
+test('invalid replacement labels retain the existing overlay and image', () => {
+  const view = viewer();
+  view.start({ modality: 'NIfTI' }); view.slice(0); view.slice(1); view.send({ type: 'complete' });
+  view.send({ type: 'labelStart', rois: [{ number: 1, color: [255, 0, 0], contours: [] }] });
+  for (let index = 0; index < 2; index++)
+    view.send({ type: 'labelSlice', index, pixels: Buffer.from(new Uint32Array([1, 1, 1, 1]).buffer).toString('base64') });
+  view.send({ type: 'labelComplete' });
+  const uploads = view.uploads.length;
+  view.send({ type: 'labelStart', rois: [] });
+  view.send({ type: 'labelSlice', index: 1, pixels: '' });
+  assert.equal(view.messages.at(-1).ok, false);
+  view.send({ type: 'labelIdle' });
+  assert.equal(view.uploads.length, uploads);
+  assert.equal(view.element('clearLabels').disabled, false);
+  view.element('labelOpacity').value = '100'; view.element('labelOpacity').handlers.input();
+  assert.deepEqual([...view.images.at(-1).data.slice(0, 4)], [255, 0, 0, 255]);
+});
+
+test('labels beyond the eighth and the 32nd label render, upload and toggle independently', () => {
+  for (const count of [10, 32]) {
+    const view = viewer();
+    view.start({ modality: 'NIfTI' }); view.slice(0); view.slice(1); view.send({ type: 'complete' });
+    assert.equal(view.element('niftiLabels').hidden, false);
+    assert.equal(view.element('roiHeading').textContent, 'Label visibility');
+    const rois = Array.from({ length: count }, (_, i) => ({ number: i + 1, color: [0, 255, 0], contours: [] }));
+    const bit = (1 << (count - 1)) >>> 0;
+    view.send({ type: 'labelStart', rois });
+    for (let index = 0; index < 2; index++)
+      view.send({ type: 'labelSlice', index, pixels: Buffer.from(new Uint32Array(4).fill(bit).buffer).toString('base64') });
+    view.element('labelOpacity').value = '100';
+    view.send({ type: 'labelComplete' });
+    assert.deepEqual([...view.uploads.at(-1).at(-1)], Array(8).fill(bit));
+    assert.equal(view.uploads.at(-1).at(-1).BYTES_PER_ELEMENT, 4);
+    assert.deepEqual([...view.images.at(-1).data.slice(0, 4)], [0, 255, 0, 255]);
+    const checkbox = view.element('roiControls').children[count - 1].children[0];
+    checkbox.checked = false; checkbox.handlers.change();
+    assert.deepEqual([...view.images.at(-1).data.slice(0, 4)], [102, 102, 102, 255]);
+  }
 });

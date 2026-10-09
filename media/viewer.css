@@ -56,6 +56,10 @@ dd { margin: 0; }
 .imageViewer aside { grid-column: auto; }
 .imageViewer #loadSeries { width: 100%; margin-bottom: 8px; }
 button:disabled { cursor: default; opacity: .6; }
+#niftiLabels { padding: 10px; margin: 10px 0; border: 1px solid var(--vscode-panel-border); }
+#niftiLabels h3 { margin-top: 0; }
+#loadLabels { width: 100%; padding: 8px; margin-bottom: 6px; color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
+#loadLabels:hover:enabled { background: var(--vscode-button-hoverBackground); }
 .imageViewer h2 small { color: var(--vscode-descriptionForeground); font-weight: normal; }
 #image { display: block; width: 100%; height: calc(100vh - 155px); min-height: 260px; background: #111; cursor: grab; touch-action: none; }
 #image:active { cursor: grabbing; }

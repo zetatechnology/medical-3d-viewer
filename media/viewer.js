@@ -14,6 +14,7 @@
   const add = (a, b) => a.map((v, i) => v + b[i]);
   const scale = (a, s) => a.map(v => v * s);
   let meta, voxels, roiMask, received = 0, bounds, renderer;
+  let labelMask = null, pendingLabels = null;
   let visibleRois = new Set();
   let yaw = 0.6, pitch = 0.35, zoom = 1.7, pan = [0, 0];
   let renderPending = false;
@@ -82,7 +83,7 @@
     controls.replaceChildren();
     visibleRois = new Set(meta.rois.map(roi => roi.number));
     if (!meta.rois.length) {
-      controls.textContent = 'No matching ROI contours.';
+      controls.textContent = meta.modality === 'NIfTI' ? 'No labels loaded. Use Load NIfTI labels above.' : 'No matching ROI contours.';
       return;
     }
     for (const roi of meta.rois) {
@@ -97,7 +98,8 @@
       const swatch = document.createElement('span');
       swatch.className = 'roiSwatch'; swatch.style.backgroundColor = roiColor(roi);
       const text = document.createElement('span');
-      text.textContent = roi.name ? `ROI ${roi.number}: ${roi.name}` : `ROI ${roi.number}`;
+      text.textContent = meta.modality === 'NIfTI' ? `Label ${roi.number}` :
+        roi.name ? `ROI ${roi.number}: ${roi.name}` : `ROI ${roi.number}`;
       label.append(input, swatch, text);
       controls.append(label);
     }
@@ -242,6 +244,18 @@
           image.data[offset] = gray;
           image.data[offset + 1] = gray;
           image.data[offset + 2] = gray;
+          if (labelMask) {
+            const [x, y, z] = volumeIndex(point).map(Math.round);
+            const bits = labelMask.data[(z * meta.rows + y) * meta.columns + x];
+            for (let i = 0; i < labelMask.rois.length; i++) {
+              const roi = labelMask.rois[i];
+              if (!(bits & (1 << i)) || !visibleRois.has(roi.number)) continue;
+              const alpha = Number($('labelOpacity').value) / 100;
+              for (let channel = 0; channel < 3; channel++)
+                image.data[offset + channel] = gray * (1 - alpha) + roi.color[channel] * alpha;
+              break;
+            }
+          }
           image.data[offset + 3] = 255;
         } else { image.data[offset + 3] = 255; }
       }
@@ -322,7 +336,7 @@
     in vec2 uv; out vec4 color;
     uniform sampler3D volume;
     uniform usampler3D roiMask;
-    uniform vec3 roiColors[8];
+    uniform vec3 roiColors[32];
     uniform vec3 sizeMm, rightVec, upVec, forwardVec, clipLow, clipHigh;
     uniform float aspect, zoom, level, windowWidth, opacity, roiOpacity, voxelScale;
     uniform vec2 pan;
@@ -362,7 +376,7 @@
           uint bits = texture(roiMask, texCoord).r & visibleRois;
           if (bits != 0u) {
             vec3 roiTint = vec3(0.0);
-            for (int j = 0; j < 8; j++) {
+            for (int j = 0; j < 32; j++) {
               if (j >= roiCount) break;
               if ((bits & (1u << uint(j))) != 0u) roiTint = roiColors[j];
             }
@@ -437,6 +451,17 @@
     renderer = null;
   }
 
+  function updateLabelTexture(mask) {
+    if (!renderer) return;
+    const { gl, roiTexture } = renderer;
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_3D, roiTexture);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R32UI, mask ? meta.columns : 1,
+      mask ? meta.rows : 1, mask ? meta.count : 1, 0,
+      gl.RED_INTEGER, gl.UNSIGNED_INT, mask ? mask.data : new Uint32Array(1));
+    if (gl.getError() !== gl.NO_ERROR) throw new Error('Could not upload the label overlay to the GPU.');
+  }
+
   function drawVolume() {
     renderPending = false;
     if (!renderer || !meta) return;
@@ -487,7 +512,7 @@
     gl.uniform1i(gl.getUniformLocation(program, 'roiCount'), roiMask?.rois.length || 0);
     let visibleBits = 0;
     if (roiMask) {
-      const colors = new Float32Array(8 * 3);
+      const colors = new Float32Array(32 * 3);
       for (let i = 0; i < roiMask.rois.length; i++) {
         const roi = roiMask.rois[i];
         colors.set(roi.color.map(channel => channel / 255), i * 3);
@@ -495,7 +520,7 @@
       }
       gl.uniform3fv(gl.getUniformLocation(program, 'roiColors[0]'), colors);
     }
-    gl.uniform1ui(gl.getUniformLocation(program, 'visibleRois'), visibleBits);
+    gl.uniform1ui(gl.getUniformLocation(program, 'visibleRois'), visibleBits >>> 0);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
@@ -540,6 +565,10 @@
       if (message.type === 'status') { status(message.text); showProgress(); }
       else if (message.type === 'start') {
         meta = message.meta;
+        labelMask = pendingLabels = null;
+        $('niftiLabels').hidden = meta.modality !== 'NIfTI';
+        $('roiHeading').textContent = meta.modality === 'NIfTI' ? 'Label visibility' : 'ROI annotations';
+        $('loadLabels').disabled = $('clearLabels').disabled = true;
         roiMask = null;
         disposeRenderer();
         voxels = meta.voxelEncoding === 'uint8'
@@ -595,13 +624,47 @@
         if (roiMask) roiMask.data = null;
         renderSlices(); requestRender();
         status('Ready'); hideProgress(); $('cancelLoad').disabled = true;
+        $('loadLabels').disabled = meta.modality !== 'NIfTI';
+      } else if (message.type === 'labelStatus') {
+        status(message.text); showProgress();
+      } else if (message.type === 'labelStart') {
+        pendingLabels = { rois: message.rois, data: new Uint32Array(voxels.length), received: 0 };
+        showProgress(0);
+      } else if (message.type === 'labelSlice') {
+        if (!pendingLabels || message.index !== pendingLabels.received) throw new Error('Label slices arrived out of order.');
+        const binary = atob(message.pixels);
+        if (binary.length !== meta.rows * meta.columns * 4) throw new Error('Invalid label slice size.');
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        pendingLabels.data.set(new Uint32Array(bytes.buffer), message.index * meta.rows * meta.columns);
+        pendingLabels.received++;
+        showProgress(pendingLabels.received * 100 / meta.count);
+        vscode.postMessage({ type: 'sliceAck', ok: true });
+      } else if (message.type === 'labelComplete') {
+        if (!pendingLabels || pendingLabels.received !== meta.count) throw new Error('Some label slices are missing.');
+        try { updateLabelTexture(pendingLabels); }
+        catch (error) { updateLabelTexture(labelMask); throw error; }
+        labelMask = roiMask = pendingLabels; pendingLabels = null;
+        meta.rois = labelMask.rois;
+        setupRoiControls(); showMeta(); renderSlices(); requestRender();
+        $('clearLabels').disabled = false;
+        status('Ready'); hideProgress();
+      } else if (message.type === 'labelError') {
+        pendingLabels = null; status(message.text); hideProgress();
+      } else if (message.type === 'labelIdle') {
+        pendingLabels = null;
+        $('loadLabels').disabled = false; $('clearLabels').disabled = !labelMask;
+        hideProgress();
       } else if (message.type === 'cancel') {
         voxels = null; status('Loading cancelled'); hideProgress(); $('cancelLoad').disabled = true;
       } else if (message.type === 'error') {
         voxels = null; status(message.text); hideProgress(); $('cancelLoad').disabled = true;
       }
     } catch (error) {
-      if (message.type === 'slice') vscode.postMessage({ type: 'sliceAck', ok: false });
+      if (message.type === 'slice' || message.type === 'labelSlice') vscode.postMessage({ type: 'sliceAck', ok: false });
+      if (message.type.startsWith('label')) {
+        pendingLabels = null; status(error.message || 'Could not display the labels.'); hideProgress(); return;
+      }
       voxels = null;
       status(error.message || 'Could not display the series.');
       hideProgress(); $('cancelLoad').disabled = true;
@@ -614,6 +677,19 @@
     renderSlices(); requestRender();
   });
   $('volumeInterpolation').addEventListener('change', requestRender);
+  $('loadLabels').addEventListener('click', () => {
+    if ($('loadLabels').disabled) return;
+    $('loadLabels').disabled = $('clearLabels').disabled = true;
+    vscode.postMessage({ type: 'loadLabels' });
+  });
+  $('clearLabels').addEventListener('click', () => {
+    if ($('clearLabels').disabled) return;
+    updateLabelTexture(null);
+    labelMask = roiMask = null; meta.rois = [];
+    setupRoiControls(); showMeta(); renderSlices(); requestRender();
+    $('clearLabels').disabled = true; status('Ready');
+  });
+  $('labelOpacity').addEventListener('input', renderSlices);
   for (const name of ['level', 'width']) $(name).addEventListener('change', () => {
     if (!currentWindow()) { status('Window width must be positive and window level must be numeric.'); return; }
     renderSlices(); requestRender();

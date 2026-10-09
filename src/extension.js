@@ -8,6 +8,7 @@ const { DicomError, readHeader, parseDicom, validateImage, validateSeries, decod
 const { RTSTRUCT, parseRtstruct } = require('./rtstruct');
 const { parseLidcXml, MAX_XML_BYTES } = require('./lidc');
 const { NiftiError, readNiftiFile, scanNiftiRange, decodeNiftiSlice } = require('./nifti');
+const { prepareLabels } = require('./nifti-labels');
 
 const MAX_FILES = 10000;
 const MAX_VOXELS = 140_000_000;
@@ -88,12 +89,20 @@ function panelHtml(panel, extensionUri) {
       </section>
       <aside aria-label="Display settings">
         <h2>Display settings</h2>
+        <div id="niftiLabels" hidden>
+          <h3>NIfTI labels</h3>
+          <button id="loadLabels" type="button" disabled>Load NIfTI labels…</button>
+          <button id="clearLabels" type="button" disabled>Remove labels</button>
+          <p class="roiMaskInfo">Overlay a label .nii or .nii.gz on the current image.</p>
+          <label id="labelOpacityControl">Label overlay opacity <input id="labelOpacity" type="range" min="0" max="100" value="45"></label>
+        </div>
         <label>Preset <select id="preset"><option value="soft">Soft tissue</option><option value="bone">Bone</option><option value="lung">Lung</option></select></label>
         <label>Window level <input id="level" type="number" value="40" step="1"></label>
         <label>Window width <input id="width" type="number" value="400" min="1" step="1"></label>
         <label>Opacity <input id="opacity" type="range" min="0" max="100" value="35"></label>
         <label>3D CT sampling <select id="volumeInterpolation"><option value="nearest">Sharp (nearest voxel)</option><option value="linear">Smooth (linear)</option></select></label>
-        <h3>ROI annotations</h3><div id="roiControls" aria-label="ROI visibility settings"></div>
+        <h3 id="roiHeading">ROI annotations</h3>
+        <div id="roiControls" aria-label="ROI visibility settings"></div>
         <label>3D ROI opacity <input id="roiOpacity" type="range" min="0" max="100" value="60"></label>
         <h3>Clipping range</h3>
         <label>X min <input id="clipX0" type="range" min="0" max="100" value="0"></label>
@@ -114,10 +123,10 @@ function safeError(error) {
   return 'Could not load the series. Check the file format and available memory.';
 }
 
-async function sendSlice(panel, cancellation, index, pixels) {
+async function sendSlice(panel, cancellation, index, pixels, type = 'slice') {
   return new Promise(resolve => {
     cancellation.ack = resolve;
-    void panel.webview.postMessage({ type: 'slice', index,
+    void panel.webview.postMessage({ type, index,
       pixels: Buffer.from(pixels.buffer, pixels.byteOffset, pixels.byteLength).toString('base64') })
       .then(delivered => { if (!delivered && cancellation.ack === resolve) { cancellation.ack = null; resolve(false); } })
       .catch(() => { if (cancellation.ack === resolve) { cancellation.ack = null; resolve(false); } });
@@ -229,9 +238,39 @@ async function loadNifti(panel, file, cancellation) {
     }
     const displayWindow = Number.isFinite(minimum) && Number.isFinite(maximum)
       ? { level: (minimum + maximum) / 2, width: Math.max(maximum - minimum, 1) } : undefined;
+    cancellation.niftiGeometry = {
+      rows: volume.rows, columns: volume.columns, count: volume.count,
+      spacing: volume.spacing, sliceSpacing: volume.sliceSpacing,
+      origin: volume.origin, row: volume.row, column: volume.column, normal: volume.normal
+    };
     await panel.webview.postMessage({ type: 'complete', displayWindow });
   } catch (error) {
     if (!cancellation.cancelled) await panel.webview.postMessage({ type: 'error', text: safeError(error) });
+  }
+}
+
+async function loadNiftiLabels(panel, cancellation) {
+  cancellation.labelsLoading = true;
+  try {
+    const selected = await vscode.window.showOpenDialog({ canSelectMany: false,
+      title: 'Select NIfTI label volume', filters: { NIfTI: ['nii', 'gz'] } });
+    if (!selected?.length || cancellation.cancelled) return;
+    if (selected[0].scheme !== 'file' || !/\.nii(?:\.gz)?$/i.test(selected[0].fsPath))
+      throw new NiftiError('FORMAT', 'Select a local .nii or .nii.gz label volume.');
+    await panel.webview.postMessage({ type: 'labelStatus', text: 'Reading NIfTI labels' });
+    const volume = await readNiftiFile(selected[0].fsPath, MAX_NIFTI_BYTES);
+    const labels = prepareLabels(cancellation.niftiGeometry, volume);
+    if (cancellation.cancelled) return;
+    await panel.webview.postMessage({ type: 'labelStart', rois: labels.rois });
+    for (let index = 0; index < volume.count; index++) {
+      if (cancellation.cancelled || !await sendSlice(panel, cancellation, index, labels.decodeSlice(index), 'labelSlice')) return;
+    }
+    await panel.webview.postMessage({ type: 'labelComplete' });
+  } catch (error) {
+    if (!cancellation.cancelled) await panel.webview.postMessage({ type: 'labelError', text: safeError(error) });
+  } finally {
+    cancellation.labelsLoading = false;
+    if (!cancellation.cancelled) await panel.webview.postMessage({ type: 'labelIdle' });
   }
 }
 
@@ -314,6 +353,8 @@ function showViewer(panel, context, loader, html = panelHtml, seriesLoader) {
   });
   panel.webview.onDidReceiveMessage(message => {
     if (message?.type === 'ready') void loader(panel, cancellation);
+    if (message?.type === 'loadLabels' && cancellation.niftiGeometry &&
+        !cancellation.cancelled && !cancellation.labelsLoading) void loadNiftiLabels(panel, cancellation);
     if (message?.type === 'loadSeries' && seriesLoader && cancellation.imageLoaded && cancellation.canLoadSeries &&
         !cancellation.cancelled && !cancellation.seriesRequested) {
       cancellation.seriesRequested = true;
