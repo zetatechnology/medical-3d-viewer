@@ -1,6 +1,7 @@
 {
   "name": "medical-3d-viewer",
   "displayName": "Medical 3D Viewer",
+  "icon": "media/icon.png",
   "description": "Local DICOM 2D image, CT series and NIfTI volume viewer with RTSTRUCT and LIDC XML overlays for VS Code (research and development use)",
   "version": "0.1.0",
   "publisher": "zetatechnology",
