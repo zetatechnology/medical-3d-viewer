@@ -1,17 +1,17 @@
 {
   "name": "medical-3d-viewer",
   "displayName": "Medical 3D Viewer",
-  "description": "Local DICOM CT series and NIfTI volume viewer for VS Code (research and development use)",
+  "description": "Local DICOM 2D image, CT series and NIfTI volume viewer with RTSTRUCT and LIDC XML overlays for VS Code (research and development use)",
   "version": "0.1.0",
   "publisher": "zetatechnology",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/hiroyakubo/medical-3d-viewer.git"
+    "url": "https://github.com/zetatechnology/medical-3d-viewer.git"
   },
-  "homepage": "https://github.com/hiroyakubo/medical-3d-viewer#readme",
+  "homepage": "https://github.com/zetatechnology/medical-3d-viewer#readme",
   "bugs": {
-    "url": "https://github.com/hiroyakubo/medical-3d-viewer/issues"
+    "url": "https://github.com/zetatechnology/medical-3d-viewer/issues"
   },
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Visualization"],

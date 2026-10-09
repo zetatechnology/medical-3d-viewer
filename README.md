@@ -1,6 +1,6 @@
 # Medical 3D Viewer for VS Code
 
-ローカルの DICOM CT シリーズと NIfTI-1 ボリュームを VS Code 内で表示する拡張機能です。Axial・Coronal・Sagittal の断面と、WebGL2 を使った 3D ボリュームを表示できます。DICOM CT では、同じ Frame of Reference を参照する RT Structure Set と、対象CTに対応するLIDC XMLの輪郭も重ねられます。
+ローカルの DICOM 白黒画像を 2D 表示し、DICOM CT シリーズと NIfTI-1 ボリュームを VS Code 内で 3D 表示する拡張機能です。Axial・Coronal・Sagittal の断面と、WebGL2 を使った 3D ボリュームを表示できます。DICOM CT では、同じ Frame of Reference を参照する RT Structure Set と、対象CTに対応するLIDC XMLの輪郭も重ねられます。
 
 > **研究・開発用途専用です。診断や治療方針の決定には使用しないでください。**
 
@@ -8,7 +8,7 @@
 
 Marketplace で公開された後は、VS Code の拡張機能ビューで「Medical 3D Viewer」を検索してインストールできます。VSIX ファイルを受け取った場合は、拡張機能ビューの「…」メニューから「VSIX からのインストール」を選びます。
 
-デスクトップ版 VS Code と WebGL2 に対応した GPU が必要です。Web 版 VS Code、Remote SSH、Codespaces での動作は対象外です。
+デスクトップ版 VS Code 1.90.0 以降が必要です。3D 表示には WebGL2 に対応した GPU が必要です。DICOM 単一画像の 2D 表示には WebGL2 を使用しません。Web 版 VS Code、Remote SSH、Codespaces での動作は対象外です。
 
 ## 使い方
 
@@ -59,8 +59,6 @@ CT画像の **Load series in 3D** で、同じフォルダー以下の `.xml` �
 - 胸部X線用の `IdriReadMessage / CXRreadingSession`、点のみの注釈、結節評価値の表示には対応していません。
 - XMLは最大16 MiB・輪郭点は1ファイルあたり100万点です。壊れたXMLや対応スライスのない輪郭は通知し、CT表示を継続します。
 
-`test-data` のCTと `072.xml` では、4読影セッション・13件のROIを読み込めます。胸部X線用の `073.xml` はCTへ重ねません。
-
 ### NIfTI
 
 - NIfTI-1 の single-file 形式（`.nii`、gzip 圧縮された `.nii.gz`）
@@ -84,4 +82,4 @@ DICOM と NIfTI の入力ファイルはローカルで読み取り専用とし�
 
 Node.js が利用できる場合は `npm test` で、合成 DICOM・RT Structure Set・LIDC XML・ROI マスク・NIfTI を使った解析と幾何検証のテストを実行できます。
 
-要件と受け入れ基準は [REQUIREMENTS.md](REQUIREMENTS.md) を参照してください。Windows・macOS・Linux の 3 OS での実機検証と性能目標の測定は未実施です。
+要件と受け入れ基準は [REQUIREMENTS.md](https://github.com/zetatechnology/medical-3d-viewer/blob/main/REQUIREMENTS.md) を参照してください。VSIX をインストールした状態での動作確認は実施済みです。検証した OS・VS Code バージョンの記録、Windows・macOS・Linux の 3 OS すべてでの検証と性能目標の測定は未完了です。
